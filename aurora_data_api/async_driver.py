@@ -494,33 +494,41 @@ class SyncAdaptedCursor:
         self.arraysize = async_cursor.arraysize
         self.description = async_cursor.description
         self._rowcount = -1
+        self._buffer = []
         self._closed = False
 
+    def __iter__(self):
+        # allow plain `for row in result:` after execute()
+        return iter(self.fetchall())
+
     def execute(self, operation, parameters=None):
+        # run the statement (await inside greenlet)
         await_only(self._cursor.execute(operation, parameters))
-        # keep SQLAlchemy informed
         self.description = self._cursor.description
-        resp = getattr(self._cursor, "_current_response", None)
-        if isinstance(resp, dict):
-            self._rowcount = resp.get("numberOfRecordsUpdated", -1)
-        else:
-            self._rowcount = -1
+
+        # **prefetch all rows while still in the greenlet**
+        self._buffer = await_only(self._cursor.fetchall())
+        self._rowcount = len(self._buffer)
         return self
 
     def executemany(self, operation, param_sets):
         await_only(self._cursor.executemany(operation, param_sets))
         self.description = None
         self._rowcount = -1
+        self._buffer = []
         return self
 
     def fetchone(self):
-        return await_only(self._cursor.fetchone())
+        return self._buffer.pop(0) if self._buffer else None
 
     def fetchmany(self, size=None):
-        return await_only(self._cursor.fetchmany(size))
+        size = size or self.arraysize
+        res, self._buffer = self._buffer[:size], self._buffer[size:]
+        return res
 
     def fetchall(self):
-        return await_only(self._cursor.fetchall())
+        res, self._buffer = self._buffer, []
+        return res
 
     def close(self):
         # Data API cursors are stateless; nothing to actually close.
