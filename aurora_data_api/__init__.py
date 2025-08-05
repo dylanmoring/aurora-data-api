@@ -147,7 +147,7 @@ class AuroraDataAPICursor:
         "text": str,
         "time": datetime.time,
         "timestamp": datetime.datetime,
-        "uuid": uuid.uuid4,
+        "uuid": uuid.UUID,
         "numeric": Decimal,
         "decimal": Decimal,
     }
@@ -165,6 +165,7 @@ class AuroraDataAPICursor:
         datetime.time: "TIME",
         datetime.datetime: "TIMESTAMP",
         Decimal: "DECIMAL",
+        uuid.UUID: "UUID",
     }
 
     def __init__(
