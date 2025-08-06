@@ -353,6 +353,7 @@ class AuroraDataAPICursorAsync:
 
     async def executemany(self, operation, seq: Iterable[Mapping[str, Any]]):
         args = self._prepare(operation, None)
+        args.pop('includeResultMetadata', None)  # no metadata for batch execute
         for batch in itertools.zip_longest(*[iter(seq)] * self.arraysize, fillvalue=None):
             params_batch = [p for p in batch if p is not None]
             args_batch = args.copy()
