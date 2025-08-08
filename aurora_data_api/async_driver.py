@@ -216,10 +216,13 @@ class AuroraDataAPIClientAsync:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        if exc:
-            await self.rollback()
-        else:
-            await self.commit()
+        try:
+            if exc:
+                await self.rollback()
+            else:
+                await self.commit()
+        finally:
+            await self.close()
 
 
 class AuroraDataAPICursorAsync:
@@ -421,10 +424,26 @@ class AuroraDataAPICursorAsync:
             raise StopAsyncIteration
         return row
 
-    def _get_error(self, e):
-        msg = getattr(e, 'response', {}).get('Error', {}).get('Message', '')
-        # TODO: map AWS messages into MySQLError/PostgreSQLError specific exceptions
-        return DatabaseError(e)
+    def _get_error(self, original_error):
+        error_msg = getattr(original_error, "response", {}).get("Error", {}).get("Message", "")
+        try:
+            res = re.search(r"Error code: (\d+); SQLState: (\d+)$", error_msg)
+            if res:  # MySQL error
+                error_code = int(res.group(1))
+                error_class = MySQLError.from_code(error_code)
+                error = error_class(error_msg)
+                error.response = getattr(original_error, "response", {})
+                return error
+            res = re.search(r"ERROR: .*(?:\n |;) Position: (\d+); SQLState: (\w+)$", error_msg)
+            if res:  # PostgreSQL error
+                error_code = res.group(2)
+                error_class = PostgreSQLError.from_code(error_code)
+                error = error_class(error_msg)
+                error.response = getattr(original_error, "response", {})
+                return error
+        except Exception:
+            pass
+        return DatabaseError(original_error)
 
 
 async def connect(
