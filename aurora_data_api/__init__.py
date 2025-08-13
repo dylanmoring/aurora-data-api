@@ -165,7 +165,6 @@ class AuroraDataAPICursor:
         datetime.time: "TIME",
         datetime.datetime: "TIMESTAMP",
         Decimal: "DECIMAL",
-        uuid.UUID: "UUID",
     }
 
     def __init__(
