@@ -1,31 +1,35 @@
 """
-Async DB-API-ish driver for Aurora Data API + small sync adapters that SQLAlchemy's
-async dialect can hand back to the sync core after awaiting.
+aurora-data-api-async - Async variant of the AWS Aurora Serverless Data API client.
 
-Expose:
-    - async def connect(...)
-    - SyncAdaptedConnection / SyncAdaptedCursor (used by the dialect)
-    - standard DB-API module globals: apilevel, threadsafety, paramstyle, etc.
+Design:
+- Reuse as much logic as possible by subclassing the sync AuroraDataAPICursor.
+- Only override methods that touch the network or iteration.
+- Manage the aioboto3 client with an async context manager (__aenter__/__aexit__).
 """
 
 from __future__ import annotations
 
 import os
-import datetime
-import ipaddress
-import uuid
+import time
+import random
+import string
 import logging
 import reprlib
+
 import itertools
 import re
+import uuid
+import ipaddress
+import datetime
 from decimal import Decimal
-from collections import namedtuple
 from collections.abc import Mapping
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Optional, List, Any
 
 import aioboto3
-from sqlalchemy.util.concurrency import await_only  # used by the sync adapters
 
+from sqlalchemy.util.concurrency import await_only
+
+# Reuse exceptions and utilities from the sync module
 from .exceptions import (
     Warning,
     Error,
@@ -40,15 +44,16 @@ from .exceptions import (
     MySQLError,
     PostgreSQLError,
 )
-from .mysql_error_codes import MySQLErrorCodes  # noqa: F401  (kept for parity with sync impl)
-from .postgresql_error_codes import PostgreSQLErrorCodes  # noqa: F401
 
-# ---------------------------------------------------------------------------
-# DB-API module attributes
-# ---------------------------------------------------------------------------
+# We subclass the sync cursor to reuse: type maps, parameter formatting,
+# response rendering, column description, etc.
+from aurora_data_api import AuroraDataAPICursor as _SyncCursor, ColumnDescription
+
+logger = logging.getLogger(__name__)
+logging.getLogger('aiobotocore.credentials').setLevel(logging.WARNING)
 
 apilevel = "2.0"
-threadsafety = 0
+threadsafety = 0  # DB-API meaning; async implies no cross-thread use of the same connection
 paramstyle = "named"
 
 Date = datetime.date
@@ -64,113 +69,310 @@ DATETIME = datetime.datetime
 ROWID = str
 DECIMAL = Decimal
 
-ColumnDescription = namedtuple(
-    "ColumnDescription",
-    "name type_code display_size internal_size precision scale null_ok"
-)
-ColumnDescription.__new__.__defaults__ = (None,) * len(ColumnDescription._fields)
 
-logger = logging.getLogger(__name__)
+class AsyncAuroraDataAPICursor(_SyncCursor):
+    """
+    Async version of the cursor. Inherits all the "pure" helpers from the sync cursor:
+    - prepare_param
+    - _set_description
+    - _render_value
+    - _render_response
+    - _format_parameter_set
+    - _get_database_error
+    And we override only the methods that actually perform I/O or iteration.
+    """
 
-__all__ = [
-    # dbapi symbols
-    "apilevel",
-    "threadsafety",
-    "paramstyle",
-    "Date",
-    "Time",
-    "Timestamp",
-    "DateFromTicks",
-    "TimestampFromTicks",
-    "Binary",
-    "STRING",
-    "BINARY",
-    "NUMBER",
-    "DATETIME",
-    "ROWID",
-    "DECIMAL",
-    # main API
-    "connect",
-    "AuroraDataAPIClientAsync",
-    "AuroraDataAPICursorAsync",
-    # sync adapters that the dialect will use
-    "SyncAdaptedConnection",
-    "SyncAdaptedCursor",
-]
-
-def _region_from_arn(arn: str) -> str:
-    # arn:partition:service:region:account-id:resource
-    return arn.split(":")[3]
-
-# ---------------------------------------------------------------------------
-# Async driver
-# ---------------------------------------------------------------------------
-
-
-class AuroraDataAPIClientAsync:
     def __init__(
         self,
-        *,
+        client=None,
+        dbname=None,
+        aurora_cluster_arn=None,
+        secret_arn=None,
+        transaction_id=None,
+        continue_after_timeout=None,
+    ):
+        super().__init__(
+            client=client,
+            dbname=dbname,
+            aurora_cluster_arn=aurora_cluster_arn,
+            secret_arn=secret_arn,
+            transaction_id=transaction_id,
+            continue_after_timeout=continue_after_timeout,
+        )
+        # Async iteration state
+        self._buffer: List[Any] | None = None
+        self._buffer_idx: int = 0
+
+    async def _start_paginated_query(self, execute_statement_args, records_per_page=None):
+        # Mirrors sync version but awaits I/O
+        pg_cursor_name = "{}_{}_{}".format(
+            __name__, int(time.time()), "".join(random.choices(string.ascii_letters + string.digits, k=8))
+        )
+        cursor_stmt = "DECLARE " + pg_cursor_name + " SCROLL CURSOR FOR "
+        execute_statement_args = dict(execute_statement_args)  # copy
+        execute_statement_args["sql"] = cursor_stmt + execute_statement_args["sql"]
+
+        await self._client.execute_statement(**execute_statement_args)
+        self._paging_state = {
+            "execute_statement_args": dict(execute_statement_args),
+            "records_per_page": records_per_page or self.arraysize,
+            "pg_cursor_name": pg_cursor_name,
+        }
+
+    async def execute(self, operation, parameters=None):
+        # Reset per-exec state
+        self._current_response, self._iterator, self._paging_state = None, None, None
+        self._buffer, self._buffer_idx = None, 0
+
+        execute_statement_args = dict(self._prepare_execute_args(operation), includeResultMetadata=True)
+        if self._continue_after_timeout is not None:
+            execute_statement_args["continueAfterTimeout"] = self._continue_after_timeout
+        if parameters:
+            execute_statement_args["parameters"] = self._format_parameter_set(parameters)
+
+        logger.debug("execute %s", reprlib.repr(operation.strip()))
+        try:
+            res = await self._client.execute_statement(**execute_statement_args)
+            if "columnMetadata" in res:
+                self._set_description(res["columnMetadata"])
+            self._current_response = self._render_response(res)
+            # Preload buffer for non-paginated responses
+            self._buffer = list(self._current_response.get("records", []))
+            self._buffer_idx = 0
+        except (self._client.exceptions.BadRequestException, self._client.exceptions.DatabaseErrorException) as e:
+            msg = str(e)
+            if "Please paginate your query" in msg:
+                await self._start_paginated_query(execute_statement_args)
+            elif "Database returned more than the allowed response size limit" in msg:
+                await self._start_paginated_query(
+                    execute_statement_args, records_per_page=max(1, self.arraysize // 2)
+                )
+            else:
+                raise self._get_database_error(e) from e
+
+        # For non-paginated case, emulate the sync driver’s iteration contract:
+        # fetch* APIs will read from _buffer; async iteration is also supported.
+
+    async def executemany(self, operation, seq_of_parameters):
+        logger.debug("executemany %s", reprlib.repr(operation.strip()))
+        for batch in self._page_input(seq_of_parameters):
+            batch_args = dict(
+                self._prepare_execute_args(operation),
+                parameterSets=[self._format_parameter_set(p) for p in batch],
+            )
+            try:
+                await self._client.batch_execute_statement(**batch_args)
+            except self._client.exceptions.BadRequestException as e:
+                raise self._get_database_error(e) from e
+
+    async def scroll(self, value, mode="relative"):
+        if not self._paging_state:
+            raise InterfaceError("Cursor scroll attempted but pagination is not active")
+        scroll_stmt = "MOVE {mode} {value} FROM {pg_cursor_name}".format(
+            mode=mode.upper(), value=value, **self._paging_state
+        )
+        scroll_args = dict(self._paging_state["execute_statement_args"], sql=scroll_stmt)
+        logger.debug("Scrolling cursor %s by %d rows", mode, value)
+        await self._client.execute_statement(**scroll_args)
+        # Invalidate buffer since we changed position
+        self._buffer, self._buffer_idx = None, 0
+
+    # ----- async iteration & fetch APIs -----
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        # Buffered (non-paginated) path
+        if not self._paging_state:
+            if not self._buffer:
+                raise StopAsyncIteration
+            if self._buffer_idx >= len(self._buffer):
+                raise StopAsyncIteration
+            row = self._buffer[self._buffer_idx]
+            self._buffer_idx += 1
+            return row
+
+        # Paginated path
+        while True:
+            # Load next page into buffer if needed
+            if not self._buffer or self._buffer_idx >= len(self._buffer):
+                next_page_args = dict(self._paging_state["execute_statement_args"])
+                next_page_args["sql"] = "FETCH {records_per_page} FROM {pg_cursor_name}".format(
+                    **self._paging_state
+                )
+                try:
+                    page = await self._client.execute_statement(**next_page_args)
+                except self._client.exceptions.BadRequestException as e:
+                    cur_rpp = self._paging_state["records_per_page"]
+                    msg = str(e)
+                    if "Database returned more than the allowed response size limit" in msg and cur_rpp > 1:
+                        # Rewind and halve page size, then retry
+                        await self.scroll(-self._paging_state["records_per_page"])
+                        logger.debug("Halving records per page")
+                        self._paging_state["records_per_page"] //= 2
+                        continue
+                    raise self._get_database_error(e) from e
+
+                if "columnMetadata" in page and not self.description:
+                    self._set_description(page["columnMetadata"])
+
+                # No more rows
+                if not page.get("records"):
+                    raise StopAsyncIteration
+
+                page = self._render_response(page)
+                self._buffer = list(page["records"])
+                self._buffer_idx = 0
+
+            # Yield next buffered row
+            row = self._buffer[self._buffer_idx]
+            self._buffer_idx += 1
+            return row
+
+    async def fetchone(self):
+        try:
+            return await self.__anext__()
+        except StopAsyncIteration:
+            return None
+
+    async def fetchmany(self, size=None):
+        if size is None:
+            size = self.arraysize
+        out = []
+        while size > 0:
+            row = await self.fetchone()
+            if row is None:
+                break
+            out.append(row)
+            size -= 1
+        return out
+
+    async def fetchall(self):
+        rows = []
+        while True:
+            row = await self.fetchone()
+            if row is None:
+                break
+            rows.append(row)
+        return rows
+
+    async def close(self):
+        # Nothing to close at the Data API cursor level; keep parity with sync
+        self._iterator = None
+        self._current_response = None
+        self._buffer, self._buffer_idx = None, 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, err_type, value, traceback):
+        await self.close()
+
+
+def _region_from_arn(arn: str) -> str:
+    return arn.split(":")[3]
+
+
+class AsyncAuroraDataAPIClient:
+    """
+    Async connection façade that mirrors the sync client but:
+    - Manages an aioboto3 client context (you must use `async with` or call `await close()`).
+    - Begins a transaction on first `await cursor()`, like the sync client.
+    - Commits on __aexit__ if no exception, otherwise rolls back.
+
+    You can inject an existing aioboto3 client via `rds_data_client=` to control lifecycle yourself.
+    """
+
+    def __init__(
+        self,
         dbname: Optional[str] = None,
         aurora_cluster_arn: Optional[str] = None,
         secret_arn: Optional[str] = None,
-        client=None,
-        client_ctx=None,
+        rds_data_client=None,
         charset: Optional[str] = None,
         continue_after_timeout: Optional[bool] = None,
+        *,
+        session: Optional[aioboto3.Session] = None,
+        region_name: Optional[str] = None,
     ):
-        self._client = client
-        self._client_ctx = client_ctx
+        self._session = session
+        self._region_name = region_name
+        self._client_ctx = None
+        self._client = rds_data_client  # if provided, we won't create/close
         self._dbname = dbname
-        self._aurora_cluster_arn = (
-            aurora_cluster_arn or os.environ.get("AURORA_CLUSTER_ARN")
-        )
+        self._aurora_cluster_arn = aurora_cluster_arn or os.environ.get("AURORA_CLUSTER_ARN")
         self._secret_arn = secret_arn or os.environ.get("AURORA_SECRET_ARN")
         self._charset = charset
-        self._transaction_id = None
+        self._transaction_id: Optional[str] = None
         self._continue_after_timeout = continue_after_timeout
 
     @classmethod
     async def connect(
-        cls,
-        *,
-        aurora_cluster_arn: Optional[str] = None,
-        secret_arn: Optional[str] = None,
-        region_name: Optional[str] = None,
-        database: Optional[str] = None,
-        charset: Optional[str] = None,
-        continue_after_timeout: Optional[bool] = None,
-    ) -> "AuroraDataAPIClientAsync":
-        """
-        Async DB-API `connect()` entry point.
-        """
-        # Pick / validate region
+            cls,
+            *,
+            aurora_cluster_arn: str | None = None,
+            secret_arn: str | None = None,
+            region_name: str | None = None,
+            database: str | None = None,
+            charset: str | None = None,
+            continue_after_timeout: bool | None = None,
+    ) -> "AsyncAuroraDataAPIClient":
+        # choose region from ARN if not provided
         arn_region = _region_from_arn(aurora_cluster_arn or secret_arn)
         if region_name is None:
             region_name = arn_region
         elif region_name != arn_region:
-            raise ValueError(
-                f"region_name ({region_name}) must match ARN region ({arn_region})"
-            )
+            raise ValueError(f"region_name ({region_name}) must match ARN region ({arn_region})")
+
         session = aioboto3.Session()
         client_ctx = session.client("rds-data", region_name=region_name)
-        client = await client_ctx.__aenter__()  # <— IMPORTANT: actually get the client
+        client = await client_ctx.__aenter__()  # IMPORTANT: actually get the client
         return cls(
             dbname=database,
             aurora_cluster_arn=aurora_cluster_arn,
             secret_arn=secret_arn,
-            client=client,
-            client_ctx=client_ctx,
+            rds_data_client=client,
             charset=charset,
             continue_after_timeout=continue_after_timeout,
-        )
+            session=session,
+            region_name=region_name,
+        )._set_client_ctx(client_ctx)
+
+    # simple helper to stash ctx (so close() can __aexit__)
+    def _set_client_ctx(self, ctx):
+        self._client_ctx = ctx
+        return self
+
+    # ----- context management & lifecycle -----
+
+    async def __aenter__(self):
+        if self._client is None:
+            session = self._session or aioboto3.Session()
+            # Important: aioboto3 returns an async context manager for the client
+            self._client_ctx = session.client("rds-data", region_name=self._region_name)
+            self._client = await self._client_ctx.__aenter__()
+        return self
+
+    async def __aexit__(self, err_type, value, traceback):
+        # Mirror sync semantics: rollback on error, else commit
+        try:
+            if err_type is not None:
+                await self.rollback()
+            else:
+                await self.commit()
+        finally:
+            if self._client_ctx is not None:
+                # Make sure the underlying HTTP resources are released
+                await self._client_ctx.__aexit__(err_type, value, traceback)
+                self._client_ctx = None
+                self._client = None
 
     async def close(self):
-        # Properly exit the aioboto3 client context
-        if self._client_ctx is not None:
-            await self._client_ctx.__aexit__(None, None, None)
-            self._client_ctx = None
-        self._client = None
+        # Explicit close without an enclosing "async with"
+        await self.__aexit__(None, None, None)
+
+    # ----- transaction control -----
 
     async def commit(self):
         if self._transaction_id:
@@ -192,15 +394,20 @@ class AuroraDataAPIClientAsync:
             )
             self._transaction_id = None
 
-    async def cursor(self) -> "AuroraDataAPICursorAsync":
+    # ----- cursor creation -----
+
+    async def cursor(self) -> AsyncAuroraDataAPICursor:
+        # Begin an explicit transaction on first cursor(), same as sync client
         if self._transaction_id is None:
             res = await self._client.begin_transaction(
                 database=self._dbname,
                 resourceArn=self._aurora_cluster_arn,
+                # schema="string",  # TODO if needed
                 secretArn=self._secret_arn,
             )
             self._transaction_id = res["transactionId"]
-        cursor = AuroraDataAPICursorAsync(
+
+        cursor = AsyncAuroraDataAPICursor(
             client=self._client,
             dbname=self._dbname,
             aurora_cluster_arn=self._aurora_cluster_arn,
@@ -209,257 +416,22 @@ class AuroraDataAPIClientAsync:
             continue_after_timeout=self._continue_after_timeout,
         )
         if self._charset:
-            await cursor.execute(f"SET character_set_client = '{self._charset}'")
+            await cursor.execute("SET character_set_client = '{}'".format(self._charset))
         return cursor
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        try:
-            if exc:
-                await self.rollback()
-            else:
-                await self.commit()
-        finally:
-            await self.close()
-
-
-class AuroraDataAPICursorAsync:
-    _pg_type_map = {
-        "int": int,
-        "int2": int,
-        "int4": int,
-        "int8": int,
-        "float4": float,
-        "float8": float,
-        "serial2": int,
-        "serial4": int,
-        "serial8": int,
-        "bool": bool,
-        "varbit": bytes,
-        "bytea": bytearray,
-        "char": str,
-        "varchar": str,
-        "cidr": ipaddress.ip_network,
-        "date": datetime.date,
-        "inet": ipaddress.ip_address,
-        "json": dict,
-        "jsonb": dict,
-        "money": str,
-        "text": str,
-        "time": datetime.time,
-        "timestamp": datetime.datetime,
-        "uuid": uuid.UUID,
-        "numeric": Decimal,
-        "decimal": Decimal,
-    }
-    _data_api_type_map = {
-        bytes: "blobValue",
-        bool: "booleanValue",
-        float: "doubleValue",
-        int: "longValue",
-        str: "stringValue",
-        Decimal: "stringValue",
-    }
-    _data_api_type_hint_map = {
-        datetime.date: "DATE",
-        datetime.time: "TIME",
-        datetime.datetime: "TIMESTAMP",
-        Decimal: "DECIMAL",
-        uuid.UUID: "UUID",
-    }
-
-    def __init__(
-        self,
-        *,
-        client,
-        dbname: Optional[str],
-        aurora_cluster_arn: str,
-        secret_arn: str,
-        transaction_id: Optional[str],
-        continue_after_timeout: Optional[bool],
-    ):
-        self.arraysize = 1000
-        self.description: Optional[List[ColumnDescription]] = None
-        self._client = client
-        self._dbname = dbname
-        self._aurora_cluster_arn = aurora_cluster_arn
-        self._secret_arn = secret_arn
-        self._transaction_id = transaction_id
-        self._continue_after_timeout = continue_after_timeout
-        self._current_response = None
-        self._records: List[Tuple[Any, ...]] = []
-
-    # ---------------------------
-    # execution helpers
-    # ---------------------------
-
-    def prepare_param(self, name, value):
-        if value is None:
-            return {"name": name, "value": {"isNull": True}}
-        t = self._data_api_type_map.get(type(value), "stringValue")
-        param = {"name": name, "value": {t: value}}
-        if t == "stringValue" and not isinstance(value, str):
-            param["value"][t] = str(value)
-        hint = self._data_api_type_hint_map.get(type(value))
-        if hint:
-            param["typeHint"] = hint
-        return param
-
-    def _set_description(self, meta):
-        self.description = []
-        for col in meta:
-            self.description.append(
-                ColumnDescription(
-                    name=col["name"],
-                    type_code=self._pg_type_map.get(col["typeName"].lower(), str),
-                )
-            )
-
-    def _prepare(self, sql, parameters):
-        args = {
-            "database": self._dbname,
-            "resourceArn": self._aurora_cluster_arn,
-            "secretArn": self._secret_arn,
-            "sql": sql,
-            "includeResultMetadata": True,
-        }
-        if self._transaction_id:
-            args["transactionId"] = self._transaction_id
-        if self._continue_after_timeout is not None:
-            args["continueAfterTimeout"] = self._continue_after_timeout
-        if parameters:
-            if not isinstance(parameters, Mapping):
-                raise NotSupportedError("Expected mapping for parameters")
-            args["parameters"] = [self.prepare_param(k, v) for k, v in parameters.items()]
-        return args
-
-    async def execute(self, operation, parameters=None):
-        self._current_response = None
-        self._records = []
-        args = self._prepare(operation, parameters)
-        logger.debug("execute %s", reprlib.repr(operation.strip()))
-        try:
-            res = await self._client.execute_statement(**args)
-            if "columnMetadata" in res:
-                self._set_description(res["columnMetadata"])
-            rendered = self._render(res)
-            self._records = rendered.get("records", [])
-            self._current_response = rendered
-        except (self._client.exceptions.BadRequestException, self._client.exceptions.DatabaseErrorException) as e:
-            msg = str(e)
-            if "Please paginate your query" in msg:
-                raise NotSupportedError("Cursor pagination is not supported in async driver") from e
-            else:
-                raise self._get_error(e) from e
-
-    async def executemany(self, operation, seq: Iterable[Mapping[str, Any]]):
-        args = self._prepare(operation, None)
-        args.pop('includeResultMetadata', None)  # no metadata for batch execute
-        for batch in itertools.zip_longest(*[iter(seq)] * self.arraysize, fillvalue=None):
-            params_batch = [p for p in batch if p is not None]
-            args_batch = args.copy()
-            args_batch["parameterSets"] = [[self.prepare_param(k, v) for k, v in p.items()] for p in params_batch]
-            try:
-                await self._client.batch_execute_statement(**args_batch)
-            except self._client.exceptions.BadRequestException as e:
-                raise self._get_error(e) from e
-
-    # ---------------------------
-    # fetch helpers
-    # ---------------------------
-
-    def _render(self, res):
-        if "records" in res:
-            for i, record in enumerate(res["records"]):
-                res["records"][i] = tuple(
-                    self._render_val(value, self.description[j] if self.description else None)
-                    for j, value in enumerate(record)
-                )
-        return res
-
-    def _render_val(self, val, desc=None):
-        if val.get("isNull"):
-            return None
-        if "arrayValue" in val:
-            arr = val["arrayValue"]
-            if "arrayValues" in arr:
-                return [self._render_val(x) for x in arr["arrayValues"]]
-            return list(arr.values())[0]
-        scalar = list(val.values())[0]
-        if desc and desc.type_code in self._data_api_type_hint_map:
-            if desc.type_code == Decimal:
-                return Decimal(scalar)
-            try:
-                return desc.type_code.fromisoformat(scalar)
-            except Exception:
-                return desc.type_code(scalar)
-        return scalar
-
-    async def fetchone(self):
-        return self._records.pop(0) if self._records else None
-
-    async def fetchmany(self, size=None):
-        size = size or self.arraysize
-        results = []
-        for _ in range(size):
-            row = await self.fetchone()
-            if row is None:
-                break
-            results.append(row)
-        return results
-
-    async def fetchall(self):
-        all_rows = self._records
-        self._records = []
-        return all_rows
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        row = await self.fetchone()
-        if row is None:
-            raise StopAsyncIteration
-        return row
-
-    def _get_error(self, original_error):
-        error_msg = getattr(original_error, "response", {}).get("Error", {}).get("Message", "")
-        try:
-            res = re.search(r"Error code: (\d+); SQLState: (\d+)$", error_msg)
-            if res:  # MySQL error
-                error_code = int(res.group(1))
-                error_class = MySQLError.from_code(error_code)
-                error = error_class(error_msg)
-                error.response = getattr(original_error, "response", {})
-                return error
-            res = re.search(r"ERROR: .*(?:\n |;) Position: (\d+); SQLState: (\w+)$", error_msg)
-            if res:  # PostgreSQL error
-                error_code = res.group(2)
-                error_class = PostgreSQLError.from_code(error_code)
-                error = error_class(error_msg)
-                error.response = getattr(original_error, "response", {})
-                return error
-        except Exception:
-            pass
-        return DatabaseError(original_error)
+    # Synchronous context manager methods are intentionally omitted; use async with.
 
 
 async def connect(
     *,
-    aurora_cluster_arn: Optional[str] = None,
-    secret_arn: Optional[str] = None,
-    region_name: Optional[str] = None,
-    database: Optional[str] = None,
-    charset: Optional[str] = None,
-    continue_after_timeout: Optional[bool] = None,
-) -> AuroraDataAPIClientAsync:
-    """
-    SQLAlchemy dialect will call this (and await it via await_only())
-    in its connect() / do_connect() override.
-    """
-    return await AuroraDataAPIClientAsync.connect(
+    aurora_cluster_arn=None,
+    secret_arn=None,
+    region_name=None,
+    database=None,
+    charset=None,
+    continue_after_timeout=None,
+):
+    return await AsyncAuroraDataAPIClient.connect(
         aurora_cluster_arn=aurora_cluster_arn,
         secret_arn=secret_arn,
         region_name=region_name,
@@ -468,97 +440,63 @@ async def connect(
         continue_after_timeout=continue_after_timeout,
     )
 
-# ---------------------------------------------------------------------------
-# Synchronous adapters for SQLAlchemy core (used *by the dialect*)
-# ---------------------------------------------------------------------------
-
 
 class SyncAdaptedConnection:
-    """
-    Synchronous facade over AuroraDataAPIClientAsync. Meant to be returned by the dialect's
-    connect() after it awaited our async connect() with await_only().
-    """
+    """Synchronous facade over AsyncAuroraDataAPIClient (for SQLAlchemy core)."""
+    def __init__(self, async_conn: AsyncAuroraDataAPIClient):
+        self._async = async_conn
 
-    def __init__(self, async_conn: AuroraDataAPIClientAsync):
-        self._async_conn = async_conn
-
-    # SQLAlchemy expects these to be synchronous methods
-
-    def cursor(self) -> "SyncAdaptedCursor":
-        async def _cursor():
-            return await self._async_conn.cursor()
-        acur = await_only(_cursor())
+    def cursor(self):
+        # return a sync-looking cursor
+        acur = await_only(self._async.cursor())
         return SyncAdaptedCursor(acur)
 
     def commit(self):
-        return await_only(self._async_conn.commit())
+        await_only(self._async.commit())
 
     def rollback(self):
-        return await_only(self._async_conn.rollback())
+        await_only(self._async.rollback())
 
     def close(self):
-        return await_only(self._async_conn.close())
+        await_only(self._async.close())
 
-    # convenience for SA which sometimes asks for .connection (esp. wrappers)
     @property
-    def connection(self):
+    def connection(self):  # some SA code accesses .connection
         return self
-
-    # helpful debug
-    def __repr__(self):
-        return f"<SyncAdaptedConnection async={self._async_conn!r}>"
-
 
 class SyncAdaptedCursor:
-    def __init__(self, async_cursor: AuroraDataAPICursorAsync):
-        self._cursor = async_cursor
+    """Synchronous DB-API-ish cursor that forwards to the async cursor."""
+    def __init__(self, async_cursor):
+        self._cur = async_cursor
         self.arraysize = async_cursor.arraysize
         self.description = async_cursor.description
-        self._rowcount = -1
-        self._buffer = []
-        self._closed = False
-
-    def __iter__(self):
-        # allow plain `for row in result:` after execute()
-        return iter(self.fetchall())
 
     def execute(self, operation, parameters=None):
-        # run the statement (await inside greenlet)
-        await_only(self._cursor.execute(operation, parameters))
-        self.description = self._cursor.description
-
-        # **prefetch all rows while still in the greenlet**
-        self._buffer = await_only(self._cursor.fetchall())
-        self._rowcount = len(self._buffer)
+        await_only(self._cur.execute(operation, parameters))
+        self.description = self._cur.description
         return self
 
-    def executemany(self, operation, param_sets):
-        await_only(self._cursor.executemany(operation, param_sets))
+    def executemany(self, operation, seq_of_parameters):
+        await_only(self._cur.executemany(operation, seq_of_parameters))
         self.description = None
-        self._rowcount = -1
-        self._buffer = []
         return self
 
     def fetchone(self):
-        return self._buffer.pop(0) if self._buffer else None
+        return await_only(self._cur.fetchone())
 
     def fetchmany(self, size=None):
-        size = size or self.arraysize
-        res, self._buffer = self._buffer[:size], self._buffer[size:]
-        return res
+        return await_only(self._cur.fetchmany(size))
 
     def fetchall(self):
-        res, self._buffer = self._buffer, []
-        return res
+        return await_only(self._cur.fetchall())
+
+    # pass-through to support your new pagination/scroll feature
+    def scroll(self, value, mode="relative"):
+        return await_only(self._cur.scroll(value, mode))
 
     def close(self):
-        # Data API cursors are stateless; nothing to actually close.
-        self._closed = True
+        await_only(self._cur.close())
 
     @property
     def rowcount(self):
-        return self._rowcount
-
-    @property
-    def closed(self):
-        return self._closed
+        return self._cur.rowcount
