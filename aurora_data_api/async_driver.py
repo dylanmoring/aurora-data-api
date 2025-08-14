@@ -270,10 +270,6 @@ class AsyncAuroraDataAPICursor(_SyncCursor):
         await self.close()
 
 
-def _region_from_arn(arn: str) -> str:
-    return arn.split(":")[3]
-
-
 class AsyncAuroraDataAPIClient:
     """
     Async connection façade that mirrors the sync client but:
@@ -307,51 +303,25 @@ class AsyncAuroraDataAPIClient:
         self._transaction_id: Optional[str] = None
         self._continue_after_timeout = continue_after_timeout
 
-    @classmethod
-    async def connect(
-            cls,
-            *,
-            aurora_cluster_arn: str | None = None,
-            secret_arn: str | None = None,
-            region_name: str | None = None,
-            database: str | None = None,
-            charset: str | None = None,
-            continue_after_timeout: bool | None = None,
-    ) -> "AsyncAuroraDataAPIClient":
-        # choose region from ARN if not provided
-        arn_region = _region_from_arn(aurora_cluster_arn or secret_arn)
-        if region_name is None:
-            region_name = arn_region
-        elif region_name != arn_region:
-            raise ValueError(f"region_name ({region_name}) must match ARN region ({arn_region})")
+    async def connect(self):
+        session = self._session or aioboto3.Session()
+        # Important: aioboto3 returns an async context manager for the client
+        self._client_ctx = session.client("rds-data", region_name=self._region_name)
+        self._client = await self._client_ctx.__aenter__()
 
-        session = aioboto3.Session()
-        client_ctx = session.client("rds-data", region_name=region_name)
-        client = await client_ctx.__aenter__()  # IMPORTANT: actually get the client
-        return cls(
-            dbname=database,
-            aurora_cluster_arn=aurora_cluster_arn,
-            secret_arn=secret_arn,
-            rds_data_client=client,
-            charset=charset,
-            continue_after_timeout=continue_after_timeout,
-            session=session,
-            region_name=region_name,
-        )._set_client_ctx(client_ctx)
-
-    # simple helper to stash ctx (so close() can __aexit__)
-    def _set_client_ctx(self, ctx):
-        self._client_ctx = ctx
-        return self
+    async def close(self):
+        if self._client_ctx is not None:
+            # Make sure the underlying HTTP resources are released
+            await self._client_ctx.__aexit__(None, None, None)
+            self._client_ctx = None
+            self._client = None
 
     # ----- context management & lifecycle -----
+    # This is not used natively by sqlalchemy, but allows using this client
+    # in an async context manager, which is useful for manual transaction control.
 
     async def __aenter__(self):
-        if self._client is None:
-            session = self._session or aioboto3.Session()
-            # Important: aioboto3 returns an async context manager for the client
-            self._client_ctx = session.client("rds-data", region_name=self._region_name)
-            self._client = await self._client_ctx.__aenter__()
+        await self.connect()
         return self
 
     async def __aexit__(self, err_type, value, traceback):
@@ -362,15 +332,7 @@ class AsyncAuroraDataAPIClient:
             else:
                 await self.commit()
         finally:
-            if self._client_ctx is not None:
-                # Make sure the underlying HTTP resources are released
-                await self._client_ctx.__aexit__(err_type, value, traceback)
-                self._client_ctx = None
-                self._client = None
-
-    async def close(self):
-        # Explicit close without an enclosing "async with"
-        await self.__aexit__(None, None, None)
+            await self.close()
 
     # ----- transaction control -----
 
@@ -419,8 +381,9 @@ class AsyncAuroraDataAPIClient:
             await cursor.execute("SET character_set_client = '{}'".format(self._charset))
         return cursor
 
-    # Synchronous context manager methods are intentionally omitted; use async with.
 
+def _region_from_arn(arn: str) -> str:
+    return arn.split(":")[3]
 
 async def connect(
     *,
@@ -431,14 +394,17 @@ async def connect(
     charset=None,
     continue_after_timeout=None,
 ):
-    return await AsyncAuroraDataAPIClient.connect(
+    region_name = region_name or _region_from_arn(aurora_cluster_arn or secret_arn)
+    connection = AsyncAuroraDataAPIClient(
+        dbname=database,
         aurora_cluster_arn=aurora_cluster_arn,
         secret_arn=secret_arn,
-        region_name=region_name,
-        database=database,
         charset=charset,
         continue_after_timeout=continue_after_timeout,
+        region_name=region_name,
     )
+    await connection.connect()
+    return connection
 
 
 class SyncAdaptedConnection:
