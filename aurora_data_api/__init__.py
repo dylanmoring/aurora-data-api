@@ -395,10 +395,12 @@ class AuroraDataAPICursor:
                 yield record
 
     def fetchone(self):
+        if self._iterator is None:
+            raise InterfaceError("No results to fetch")
         try:
             return next(self._iterator)
         except StopIteration:
-            pass
+            return None
 
     def fetchmany(self, size=None):
         if size is None:
@@ -413,6 +415,8 @@ class AuroraDataAPICursor:
         return results
 
     def fetchall(self):
+        if self._iterator is None:
+            raise InterfaceError("No results to fetch")
         return list(self._iterator)
 
     def setinputsizes(self, sizes):

@@ -1,7 +1,7 @@
 SHELL=/bin/bash
 
 lint:
-	ruff .
+ruff check .
 
 test: lint
 	python ./test/test.py -v
