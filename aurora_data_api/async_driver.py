@@ -88,16 +88,16 @@ class AsyncAuroraDataAPICursor(_SyncCursor):
         dbname=None,
         aurora_cluster_arn=None,
         secret_arn=None,
-        transaction_id=None,
         continue_after_timeout=None,
+        parent_connection=None,
     ):
         super().__init__(
             client=client,
             dbname=dbname,
             aurora_cluster_arn=aurora_cluster_arn,
             secret_arn=secret_arn,
-            transaction_id=transaction_id,
             continue_after_timeout=continue_after_timeout,
+            parent_connection=parent_connection,
         )
         # Async iteration state
         self._buffer: List[Any] | None = None

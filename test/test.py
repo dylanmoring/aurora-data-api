@@ -163,7 +163,7 @@ class TestAuroraDataAPI(unittest.TestCase):
             sql = sql_template.format(", ".join("concat({})".format(concat_args) for i in range(32)))
             cur.execute(sql)
             with self.assertRaisesRegex(
-                conn._client.exceptions.BadRequestException, "Database response exceeded size limit"
+                conn.client.exceptions.BadRequestException, "Database response exceeded size limit"
             ):
                 cur.fetchall()
 
@@ -217,7 +217,7 @@ class TestAuroraDataAPI(unittest.TestCase):
 
         try:
             with aurora_data_api.connect(database=self.db_name) as conn, conn.cursor() as cur:
-                with self.assertRaisesRegex(conn._client.exceptions.ClientError, "StatementTimeoutException"):
+                with self.assertRaisesRegex(conn.client.exceptions.ClientError, "StatementTimeoutException"):
                     cur.execute(
                         (
                             "INSERT INTO aurora_data_api_test(name) SELECT 'continue_after_timeout'"
@@ -234,7 +234,7 @@ class TestAuroraDataAPI(unittest.TestCase):
             with aurora_data_api.connect(
                 database=self.db_name, continue_after_timeout=True
             ) as conn, conn.cursor() as cur:
-                with self.assertRaisesRegex(conn._client.exceptions.ClientError, "StatementTimeoutException"):
+                with self.assertRaisesRegex(conn.client.exceptions.ClientError, "StatementTimeoutException"):
                     cur.execute(
                         (
                             "INSERT INTO aurora_data_api_test(name) SELECT 'continue_after_timeout' "
