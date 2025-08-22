@@ -35,6 +35,7 @@ from sqlalchemy.util.concurrency import await_only
 # Shared helpers from sync package
 from .type_conversion import build_description, format_parameters, convert_value
 from .exceptions import translate_database_error, InterfaceError, DatabaseError
+from .retry import retry_exceptions
 
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,7 @@ class AsyncAuroraDataAPIClient:
 
     # ----- transaction control -----
 
+    @retry_exceptions(3, 3, 6, exceptions="DatabaseResumingException")
     async def start_transaction(self):
         if self._transaction_id is not None:
             return self._transaction_id
@@ -213,6 +215,7 @@ class AsyncAuroraDataAPICursor:
         # reset buffer for paged mode
         self._buffer, self._buffer_idx = None, 0
 
+    @retry_exceptions(3, 3, 6, exceptions="DatabaseResumingException")
     async def execute(self, operation, parameters=None):
         # Reset per-exec state
         self._current_response, self._paging_state = None, None
@@ -251,6 +254,7 @@ class AsyncAuroraDataAPICursor:
         # For non-paginated case, emulate the sync driver’s iteration contract:
         # fetch* APIs will read from _buffer; async iteration is also supported.
 
+    @retry_exceptions(3, 3, 6, exceptions="DatabaseResumingException")
     async def executemany(self, operation, seq_of_parameters):
         logger.debug("executemany %s", reprlib.repr(operation.strip()))
         for batch in _page_input(seq_of_parameters, page_size=self.arraysize):

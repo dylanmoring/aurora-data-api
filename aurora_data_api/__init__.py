@@ -7,6 +7,7 @@ import boto3
 
 from .type_conversion import build_description, format_parameters, convert_value
 from .exceptions import translate_database_error, InterfaceError, NotSupportedError, DatabaseError
+from .retry import retry_exceptions
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,7 @@ class AuroraDataAPIClient:
         else:
             self.commit()
 
+    @retry_exceptions(3, 3, 6, exceptions="DatabaseResumingException")
     def start_transaction(self):
         if self._transaction_id is not None:
             return self._transaction_id
@@ -131,6 +133,7 @@ class AuroraDataAPICursor:
             "pg_cursor_name": pg_cursor_name,
         }
 
+    @retry_exceptions(3, 3, 6, exceptions="DatabaseResumingException")
     def execute(self, operation, parameters=None):
         self._current_response, self._iterator, self._paging_state = None, None, None
         execute_statement_args: dict = dict(
@@ -176,6 +179,7 @@ class AuroraDataAPICursor:
         iterable = iter(iterable)
         return iter(lambda: list(itertools.islice(iterable, page_size)), [])
 
+    @retry_exceptions(3, 3, 6, exceptions="DatabaseResumingException")
     def executemany(self, operation, seq_of_parameters):
         # No autotransaction here either; batching is auto-committed unless outer tx active
         logger.debug("executemany %s", reprlib.repr(operation.strip()))
