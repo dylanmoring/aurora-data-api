@@ -78,17 +78,22 @@ class AuroraDataAPIClient:
             self.commit()
 
     def start_transaction(self):
-        """
-        Begin a transaction and cache the transaction id.  Returns the
-        active transaction_id.
-        """
-        if self._transaction_id is None:
+        if self._transaction_id is not None:
+            return self._transaction_id
+        try:
             res = self.client.begin_transaction(
                 database=self._dbname,
                 resourceArn=self._aurora_cluster_arn,
                 secretArn=self._secret_arn,
             )
-            self._transaction_id = res["transactionId"]
+        except (self.client.exceptions.BadRequestException,
+                self.client.exceptions.DatabaseErrorException) as e:
+            # RDS returned an application/db error → map to DB-API subclass
+            raise translate_database_error(e) from e
+        except Exception as e:
+            # Network/credential/endpoint issues, etc.
+            raise DatabaseError(e) from e
+        self._transaction_id = res["transactionId"]
         return self._transaction_id
 
     def _prepare_execute_args(self, operation):

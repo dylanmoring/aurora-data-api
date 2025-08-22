@@ -110,13 +110,20 @@ class AsyncAuroraDataAPIClient:
     # ----- transaction control -----
 
     async def start_transaction(self):
-        if self._transaction_id is None:
+        if self._transaction_id is not None:
+            return self._transaction_id
+        try:
             res = await self.client.begin_transaction(
                 database=self._dbname,
                 resourceArn=self._aurora_cluster_arn,
                 secretArn=self._secret_arn,
             )
-            self._transaction_id = res["transactionId"]
+        except (self.client.exceptions.BadRequestException,
+                self.client.exceptions.DatabaseErrorException) as e:
+            raise translate_database_error(e) from e
+        except Exception as e:
+            raise DatabaseError(e) from e
+        self._transaction_id = res["transactionId"]
         return self._transaction_id
 
     async def commit(self):
