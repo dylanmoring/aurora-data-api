@@ -168,10 +168,6 @@ class AsyncAuroraDataAPIClient:
             await cur.execute("SET character_set_client = '{}'".format(self._charset))
         return cur
 
-def _page_input(iterable, page_size=1000):
-    iterable = iter(iterable)
-    return iter(lambda: list(itertools.islice(iterable, page_size)), [])
-
 
 class AsyncAuroraDataAPICursor:
     def __init__(self, connection: AsyncAuroraDataAPIClient, arraysize: int = 1000):
@@ -199,12 +195,13 @@ class AsyncAuroraDataAPICursor:
         return response
 
     async def _start_paginated_query(self, execute_statement_args, records_per_page=None):
-        pg_cursor_name = "{}_{}_{}".format(
+        pg_cursor_name = '"{}_{}_{}"'.format(
             __name__, int(time.time()), "".join(random.choices(string.ascii_letters + string.digits, k=8))
         )
         cursor_stmt = "DECLARE " + pg_cursor_name + " SCROLL CURSOR FOR "
         execute_statement_args = dict(execute_statement_args)  # copy
         execute_statement_args["sql"] = cursor_stmt + execute_statement_args["sql"]
+        logger.debug(f'Starting paginated query with cursor "{pg_cursor_name}"', extra = execute_statement_args)
 
         await self._connection.client.execute_statement(**execute_statement_args)
         self._paging_state = {
@@ -214,6 +211,8 @@ class AsyncAuroraDataAPICursor:
         }
         # reset buffer for paged mode
         self._buffer, self._buffer_idx = None, 0
+        # Fetch the first page into buffer
+        await self._fetch_next_page_into_buffer()
 
     @retry_exceptions(4, 2, 2, 4, exceptions="DatabaseResumingException")
     async def execute(self, operation, parameters=None):
@@ -233,7 +232,7 @@ class AsyncAuroraDataAPICursor:
         logger.debug("execute %s", reprlib.repr(operation.strip()))
         try:
             res = await self._connection.client.execute_statement(**execute_statement_args)
-            if "columnMetadata" in res:
+            if "columnMetadata" in res and not self.description:
                 self._set_description(res["columnMetadata"])
             self._current_response = self._render_response(res)
             # Preload buffer for non-paginated responses
@@ -261,7 +260,7 @@ class AsyncAuroraDataAPICursor:
     @retry_exceptions(4, 2, 2, 4, exceptions="DatabaseResumingException")
     async def executemany(self, operation, seq_of_parameters):
         logger.debug("executemany %s", reprlib.repr(operation.strip()))
-        for batch in _page_input(seq_of_parameters, page_size=self.arraysize):
+        for batch in self._page_input(seq_of_parameters, page_size=self.arraysize):
             batch_args = dict(
                 self._connection._prepare_execute_args(operation),
                 parameterSets=[format_parameters(p) for p in batch],
@@ -288,50 +287,70 @@ class AsyncAuroraDataAPICursor:
     def __aiter__(self):
         return self
 
+    def _has_buffered_row(self) -> bool:
+        return bool(self._buffer) and self._buffer_idx < len(self._buffer)
+
+    def _pop_buffered_row(self) -> tuple[Any, ...] | None:
+        if not self._has_buffered_row():
+            return None
+        row = self._buffer[self._buffer_idx]
+        self._buffer_idx += 1
+        return row
+
+    async def _fetch_next_page_into_buffer(self) -> None:
+        """Fetches the next page into _buffer. Sets description if not set yet.
+        On oversize, halves page size and retries."""
+        if not self._paging_state:
+            raise InterfaceError("Paging state missing while fetching next page")
+
+        while True:
+            next_page_args = dict(self._paging_state["execute_statement_args"])
+            rpp = self._paging_state["records_per_page"]
+            next_page_args["sql"] = f'FETCH {rpp} FROM {self._paging_state["pg_cursor_name"]}'
+
+            try:
+                page = await self._connection.client.execute_statement(**next_page_args)
+            except self._connection.client.exceptions.UnsupportedResultException as e:
+                # 1 MiB response limit. Try smaller pages.
+                if "The result exceeds the size limit" in str(e) and rpp > 1:
+                    await self.scroll(-rpp, mode="relative")
+                    logger.debug("Halving records per page")
+                    self._paging_state["records_per_page"] = max(1, rpp // 2)
+                    continue
+                raise
+            except (self._connection.client.exceptions.BadRequestException,
+                    self._connection.client.exceptions.DatabaseErrorException) as e:
+                raise translate_database_error(e) from e
+
+            if page.get("columnMetadata") and not self.description:
+                self._set_description(page["columnMetadata"])
+
+            page = self._render_response(page)
+            self._buffer = list(page.get("records", []))  # materialize rows for fetch APIs
+            self._buffer_idx = 0
+            return
+
+
     async def __anext__(self):
         # Non-paginated path uses preloaded buffer
         if not self._paging_state:
-            if not self._buffer or self._buffer_idx >= len(self._buffer):
+            row = self._pop_buffered_row()
+            if row is None:
                 raise StopAsyncIteration
-            row = self._buffer[self._buffer_idx]
-            self._buffer_idx += 1
             return row
 
         # Paginated path: fetch pages lazily
-        while True:
-            if not self._buffer or self._buffer_idx >= len(self._buffer):
-                next_page_args = dict(self._paging_state["execute_statement_args"])
-                next_page_args["sql"] = "FETCH {records_per_page} FROM {pg_cursor_name}".format(
-                    **self._paging_state
-                )
-                try:
-                    page = await self._connection.client.execute_statement(**next_page_args)
-                except self._connection.client.exceptions.UnsupportedResultException as e:
-                    cur_rpp = self._paging_state["records_per_page"]
-                    if "The result exceeds the size limit" in str(e) and cur_rpp > 1:
-                        await self.scroll(-self._paging_state["records_per_page"])
-                        logger.debug("Halving records per page")
-                        self._paging_state["records_per_page"] //= 2
-                        continue
-                    else:
-                        raise e
-                except (self._connection.client.exceptions.BadRequestException,
-                        self._connection.client.exceptions.DatabaseErrorException) as e:
-                    raise translate_database_error(e) from e
-
-                if "columnMetadata" in page and not self.description:
-                    self._set_description(page["columnMetadata"])
-
-                if not page.get("records"):
-                    raise StopAsyncIteration
-
-                page = self._render_response(page)
-                self._buffer = list(page["records"])  # materialize rows for fetch APIs
-                self._buffer_idx = 0
-
-            row = self._buffer[self._buffer_idx]
-            self._buffer_idx += 1
+        row = self._pop_buffered_row()
+        if row is not None:
             return row
+
+        # Need a new page
+        await self._fetch_next_page_into_buffer()
+        row = self._pop_buffered_row()
+        if row is None:
+            # no rows even after fetch => done
+            raise StopAsyncIteration
+        return row
 
     async def fetchone(self):
         try:
@@ -385,6 +404,11 @@ class AsyncAuroraDataAPICursor:
         if self._current_response and self._current_response.get("generatedFields"):
             return convert_value(self._current_response["generatedFields"][-1])
         return None
+
+    def _page_input(self, iterable, page_size: int | None = None):
+        page_size = page_size or self.arraysize
+        iterable = iter(iterable)
+        return iter(lambda: list(itertools.islice(iterable, page_size)), [])
 
 
 

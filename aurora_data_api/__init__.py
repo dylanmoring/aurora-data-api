@@ -121,7 +121,7 @@ class AuroraDataAPICursor:
         self.description = build_description(column_metadata)
 
     def _start_paginated_query(self, execute_statement_args, records_per_page=None):
-        pg_cursor_name = "{}_{}_{}".format(
+        pg_cursor_name = '"{}_{}_{}"'.format(
             __name__, int(time.time()), "".join(random.choices(string.ascii_letters + string.digits, k=8))
         )
         cursor_stmt = "DECLARE " + pg_cursor_name + " SCROLL CURSOR FOR "
