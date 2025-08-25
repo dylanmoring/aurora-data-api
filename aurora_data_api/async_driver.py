@@ -241,15 +241,19 @@ class AsyncAuroraDataAPICursor:
             self._buffer_idx = 0
         except (self._connection.client.exceptions.BadRequestException,
                 self._connection.client.exceptions.DatabaseErrorException) as e:
-            msg = str(e)
-            if "Please paginate your query" in msg:
-                await self._start_paginated_query(execute_statement_args)
-            elif "Database returned more than the allowed response size limit" in msg:
-                await self._start_paginated_query(
-                    execute_statement_args, records_per_page=max(1, self.arraysize // 2)
-                )
+            raise translate_database_error(e) from e
+        except self._connection.client.exceptions.UnsupportedResultException as e:
+            if "The result exceeds the size limit" in str(e):
+                logger.info(f'Switching to paginated query for "{operation.strip()[:30]}..."')
+                try:
+                    await self._start_paginated_query(execute_statement_args)
+                except self._connection.client.exceptions.UnsupportedResultException as e:
+                    logger.info(f'Retrying paginated query with smaller pages "{operation.strip()[:30]}..."')
+                    if "The result exceeds the size limit" in str(e):
+                        await self._start_paginated_query(
+                            execute_statement_args, records_per_page=max(1, self.arraysize // 2))
             else:
-                raise translate_database_error(e) from e
+                raise e
 
         # For non-paginated case, emulate the sync driver’s iteration contract:
         # fetch* APIs will read from _buffer; async iteration is also supported.
@@ -302,14 +306,17 @@ class AsyncAuroraDataAPICursor:
                 )
                 try:
                     page = await self._connection.client.execute_statement(**next_page_args)
-                except self._connection.client.exceptions.BadRequestException as e:
+                except self._connection.client.exceptions.UnsupportedResultException as e:
                     cur_rpp = self._paging_state["records_per_page"]
-                    msg = str(e)
-                    if "Database returned more than the allowed response size limit" in msg and cur_rpp > 1:
+                    if "The result exceeds the size limit" in str(e) and cur_rpp > 1:
                         await self.scroll(-self._paging_state["records_per_page"])
                         logger.debug("Halving records per page")
                         self._paging_state["records_per_page"] //= 2
                         continue
+                    else:
+                        raise e
+                except (self._connection.client.exceptions.BadRequestException,
+                        self._connection.client.exceptions.DatabaseErrorException) as e:
                     raise translate_database_error(e) from e
 
                 if "columnMetadata" in page and not self.description:

@@ -152,12 +152,17 @@ class AuroraDataAPICursor:
             self._current_response = self._render_response(res)
         except (self._connection.client.exceptions.BadRequestException,
                 self._connection.client.exceptions.DatabaseErrorException) as e:
-            if "Please paginate your query" in str(e):
-                self._start_paginated_query(execute_statement_args)
-            elif "Database returned more than the allowed response size limit" in str(e):
-                self._start_paginated_query(execute_statement_args, records_per_page=max(1, self.arraysize // 2))
+            raise translate_database_error(e) from e
+        except self._connection.client.exceptions.UnsupportedResultException as e:
+            if "The result exceeds the size limit" in str(e):
+                try:
+                    self._start_paginated_query(execute_statement_args)
+                except self._connection.client.exceptions.UnsupportedResultException as e:
+                    if "The result exceeds the size limit" in str(e):
+                        self._start_paginated_query(
+                            execute_statement_args, records_per_page=max(1, self.arraysize // 2))
             else:
-                raise translate_database_error(e) from e
+                raise e
         self._iterator = iter(self)
 
     @property
@@ -223,15 +228,18 @@ class AuroraDataAPICursor:
                 next_page_args["sql"] = "FETCH {records_per_page} FROM {pg_cursor_name}".format(**self._paging_state)
                 try:
                     page = self._connection.client.execute_statement(**next_page_args)
-                except self._connection.client.exceptions.BadRequestException as e:
+                except self._connection.client.exceptions.UnsupportedResultException as e:
                     cur_rpp = self._paging_state["records_per_page"]
-                    if "Database returned more than the allowed response size limit" in str(e) and cur_rpp > 1:
-                        self.scroll(-self._paging_state["records_per_page"])  # Rewind the cursor to read the page again
+                    if "The result exceeds the size limit" in str(e) and cur_rpp > 1:
+                        self.scroll(-self._paging_state["records_per_page"])
                         logger.debug("Halving records per page")
                         self._paging_state["records_per_page"] //= 2
                         continue
                     else:
-                        raise translate_database_error(e) from e
+                        raise e
+                except (self._connection.client.exceptions.BadRequestException,
+                        self._connection.client.exceptions.DatabaseErrorException) as e:
+                    raise translate_database_error(e) from e
 
                 if "columnMetadata" in page and not self.description:
                     self._set_description(page["columnMetadata"])
