@@ -166,7 +166,10 @@ class AuroraDataAPICursor:
             raise translate_database_error(e) from e
         except self._connection.client.exceptions.UnsupportedResultException as e:
             if "The result exceeds the size limit" in str(e):
-                logger.info(f'Switching to paginated query for "{operation.strip()[:30]}..."')
+                logger.info(
+                    f'Switching to paginated query for "{operation.strip()[:30]}..."',
+                    extra=dict(query=operation.strip()[:2000])
+                )
                 try:
                     self._start_paginated_query(execute_statement_args)
                 except self._connection.client.exceptions.UnsupportedResultException as e2:
