@@ -126,6 +126,7 @@ class AsyncAuroraDataAPIClient:
         except Exception as e:
             raise DatabaseError(e) from e
         self._transaction_id = res["transactionId"]
+        logger.info(f"Started transaction {self._transaction_id}")
         return self._transaction_id
 
     async def commit(self):
@@ -135,9 +136,10 @@ class AsyncAuroraDataAPIClient:
                 secretArn=self._secret_arn,
                 transactionId=self._transaction_id,
             )
-            self._transaction_id = None
             if res.get("transactionStatus") != "Transaction Committed":
                 raise DatabaseError(f"Error while committing transaction: {res}")
+            logger.info(f"Committed transaction {self._transaction_id}")
+            self._transaction_id = None
 
     async def rollback(self):
         if self._transaction_id:
@@ -146,6 +148,7 @@ class AsyncAuroraDataAPIClient:
                 secretArn=self._secret_arn,
                 transactionId=self._transaction_id,
             )
+            logger.info(f"Rolled back transaction {self._transaction_id}")
             self._transaction_id = None
 
     # ----- cursor creation -----
