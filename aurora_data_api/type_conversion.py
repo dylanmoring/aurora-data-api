@@ -22,7 +22,10 @@ DATETIME = datetime.datetime
 ROWID = str
 DECIMAL = Decimal
 
-ColumnDescription = namedtuple("ColumnDescription", "name type_code display_size internal_size precision scale null_ok")
+ColumnDescription = namedtuple(
+    "ColumnDescription",
+    "name type_code display_size internal_size precision scale null_ok pg_type_name",
+)
 ColumnDescription.__new__.__defaults__ = (None,) * len(ColumnDescription._fields)
 
 # Postgres type name -> Python type for description.type_code
@@ -34,12 +37,20 @@ _PG_TYPE_MAP = {
     "varbit": bytes, "bytea": bytearray,
     "char": str, "varchar": str, "text": str,
     "cidr": ipaddress.ip_network, "inet": ipaddress.ip_address,
-    "date": datetime.date, "time": datetime.time, "timestamp": datetime.datetime,
+    "date": datetime.date,
+    "time": datetime.time, "timetz": datetime.time,
+    "timestamp": datetime.datetime, "timestamptz": datetime.datetime,
     "uuid": uuid.UUID,
     "json": dict, "jsonb": dict,
     "money": str,
     "numeric": Decimal, "decimal": Decimal,
 }
+
+# PG types whose returned value represents a moment in time anchored to UTC.
+# The Data API normalises timestamptz/timetz to UTC on the wire and strips
+# the offset suffix, so the parsed value comes back naive even though it is
+# semantically UTC. We attach tzinfo=utc on parse to restore that meaning.
+_PG_TZ_AWARE_TYPES = frozenset({"timestamptz", "timetz"})
 
 # Python value type -> RDS Data API field name
 _DATA_API_TYPE_MAP = {
@@ -64,10 +75,12 @@ def build_description(column_metadata):
     """Return DB-API description list from column metadata."""
     desc = []
     for column in column_metadata:
-        type_code = _PG_TYPE_MAP.get(column["typeName"].lower(), str)
+        pg_type_name = column["typeName"].lower()
+        type_code = _PG_TYPE_MAP.get(pg_type_name, str)
         col_desc = ColumnDescription(
             name=column["name"],
             type_code=type_code,
+            pg_type_name=pg_type_name,
         )
         desc.append(col_desc)
     return desc
@@ -112,15 +125,26 @@ def convert_value(value_dict, col_desc=None):
         if tc is Decimal:
             return Decimal(scalar)
         try:
-            return tc.fromisoformat(scalar)
+            parsed = tc.fromisoformat(scalar)
         except (AttributeError, ValueError):
             # Fallbacks for older Python / non-ISO strings
             if tc is datetime.date:
-                return datetime.datetime.strptime(scalar, "%Y-%m-%d").date()
-            if tc is datetime.time:
-                return datetime.datetime.strptime(scalar, "%H:%M:%S").time()
-            if "." in scalar:
-                return datetime.datetime.strptime(scalar, "%Y-%m-%d %H:%M:%S.%f")
-            return datetime.datetime.strptime(scalar, "%Y-%m-%d %H:%M:%S")
+                parsed = datetime.datetime.strptime(scalar, "%Y-%m-%d").date()
+            elif tc is datetime.time:
+                parsed = datetime.datetime.strptime(scalar, "%H:%M:%S").time()
+            elif "." in scalar:
+                parsed = datetime.datetime.strptime(scalar, "%Y-%m-%d %H:%M:%S.%f")
+            else:
+                parsed = datetime.datetime.strptime(scalar, "%Y-%m-%d %H:%M:%S")
+        # For tz-aware PG types the Data API serialises in UTC but strips the
+        # offset, so fromisoformat returns a naive value. Attach UTC so consumer
+        # code can do arithmetic against other aware datetimes without TypeError.
+        if (
+            col_desc.pg_type_name in _PG_TZ_AWARE_TYPES
+            and isinstance(parsed, (datetime.datetime, datetime.time))
+            and parsed.tzinfo is None
+        ):
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed
     return scalar
 
