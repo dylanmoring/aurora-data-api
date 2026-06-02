@@ -20,6 +20,7 @@ import os
 import time
 import random
 import string
+import asyncio
 import logging
 import itertools
 import reprlib
@@ -142,14 +143,30 @@ class AsyncAuroraDataAPIClient:
             self._transaction_id = None
 
     async def rollback(self):
-        if self._transaction_id:
-            await self.client.rollback_transaction(
+        if not self._transaction_id:
+            return
+        tx_id = self._transaction_id
+        self._transaction_id = None
+        # Schedule as a detached task and shield the await: if the parent task
+        # is being cancelled (e.g. Lambda imminent-timeout), the outer await
+        # raises CancelledError but the inner HTTPS request keeps running on
+        # the loop and can still land server-side before the loop tears down.
+        rollback_task = asyncio.create_task(
+            self.client.rollback_transaction(
                 resourceArn=self._aurora_cluster_arn,
                 secretArn=self._secret_arn,
-                transactionId=self._transaction_id,
+                transactionId=tx_id,
             )
-            logger.info(f"Rolled back transaction {self._transaction_id}")
-            self._transaction_id = None
+        )
+        try:
+            await asyncio.shield(rollback_task)
+            logger.info(f"Rolled back transaction {tx_id}")
+        except asyncio.CancelledError:
+            logger.warning(
+                f"Rollback of {tx_id} interrupted by outer cancellation; "
+                f"shielded request continues until event loop teardown"
+            )
+            raise
 
     # ----- cursor creation -----
 
