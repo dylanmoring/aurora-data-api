@@ -18,6 +18,12 @@ threadsafety = 0
 paramstyle = "named"
 
 
+def _region_from_arn(arn: str) -> str:
+    """Extract the AWS region segment from a cluster or secret ARN. Mirrors
+    the helper on the async driver so both paths derive region the same way."""
+    return arn.split(":")[3]
+
+
 class AuroraDataAPIClient:
     _client_init_lock = threading.Lock()
 
@@ -29,16 +35,29 @@ class AuroraDataAPIClient:
         rds_data_client=None,
         charset=None,
         continue_after_timeout=None,
+        region_name=None,
     ):
-        # AWS client and connection config
+        # Resolve ARNs first so we can derive region from them if caller
+        # didn't pass one explicitly.
+        self._aurora_cluster_arn = aurora_cluster_arn or os.environ.get("AURORA_CLUSTER_ARN")
+        self._secret_arn = secret_arn or os.environ.get("AURORA_SECRET_ARN")
+
+        # AWS client. If the caller didn't inject one, build it with the
+        # region pulled from the cluster (or secret) ARN — boto3's default
+        # region resolution can otherwise pick a region that doesn't match
+        # the resourceArn we're about to use, producing the "Invalid region
+        # in ARN" ValidationException at first ExecuteStatement. The async
+        # driver mirrors this trick in its module-level connect().
         self.client = rds_data_client
         if self.client is None:
             with self._client_init_lock:
-                self.client = boto3.client("rds-data")
+                arn_for_region = self._aurora_cluster_arn or self._secret_arn
+                client_region = region_name or (
+                    _region_from_arn(arn_for_region) if arn_for_region else None
+                )
+                self.client = boto3.client("rds-data", region_name=client_region)
 
         self._dbname = dbname
-        self._aurora_cluster_arn = aurora_cluster_arn or os.environ.get("AURORA_CLUSTER_ARN")
-        self._secret_arn = secret_arn or os.environ.get("AURORA_SECRET_ARN")
         # Session-level options
         self._charset = charset
         self._continue_after_timeout = continue_after_timeout
@@ -370,6 +389,7 @@ def connect(
     password=None,
     charset=None,
     continue_after_timeout=None,
+    region_name=None,
 ):
     return AuroraDataAPIClient(
         dbname=database,
@@ -378,4 +398,5 @@ def connect(
         rds_data_client=rds_data_client,
         charset=charset,
         continue_after_timeout=continue_after_timeout,
+        region_name=region_name,
     )
