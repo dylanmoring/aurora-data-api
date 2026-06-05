@@ -137,6 +137,17 @@ def convert_value(value_dict, col_desc=None):
             return int(scalar)
         except (TypeError, ValueError):
             return scalar
+    # UUID columns arrive as ``stringValue`` too. SQLAlchemy's PG ``UUID``
+    # type expects the DBAPI to return ``uuid.UUID`` (or a string the
+    # default result processor parses — but our description-driven path
+    # bypasses that). Coerce here so application code that types columns
+    # as ``UUID(as_uuid=True)`` gets a real ``uuid.UUID`` rather than a
+    # string, matching psycopg2 / asyncpg behavior.
+    if tc is uuid.UUID and isinstance(scalar, str):
+        try:
+            return uuid.UUID(scalar)
+        except (TypeError, ValueError):
+            return scalar
     # If the column's Python type suggests a string-encoded temporal/decimal, coerce
     if tc in _DATA_API_TYPE_HINT_MAP:
         if tc is Decimal:
