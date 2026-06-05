@@ -26,9 +26,16 @@ def translate_database_error(original_error):
             error = error_class(error_msg)
             error.response = getattr(original_error, "response", {})
             return error
-        res = re.search(r"ERROR: .*(?:\n |;) Position: (\d+); SQLState: (\w+)$", error_msg)
+        # ``Position`` is only present for syntax-style errors; integrity /
+        # check / FK / unique violations omit it. Make it optional so those
+        # errors still translate to the right DB-API subclass via the
+        # SQLSTATE class prefix.
+        res = re.search(
+            r"ERROR: .*(?:\n |;)(?: Position: \d+;)? SQLState: (\w+)$",
+            error_msg,
+        )
         if res:  # PostgreSQL error
-            error_code = res.group(2)
+            error_code = res.group(1)
             error_class = PostgreSQLError.from_code(error_code)
             error = error_class(error_msg)
             error.response = getattr(original_error, "response", {})
