@@ -41,8 +41,17 @@ del _dt
 
 
 import re as _re
-_LEADING_KEYWORD_RE = _re.compile(r"^\s*(?:WITH\b.*?\)\s*)?(\w+)", _re.IGNORECASE | _re.DOTALL)
+# Leading whitespace, optional ``(`` or ``WITH ... AS (...)`` prefix, then the
+# first keyword token. Handles ``(SELECT ...) UNION ...``,
+# ``WITH cte AS (...) SELECT ...``, and ordinary ``SELECT ...``.
+_LEADING_KEYWORD_RE = _re.compile(
+    r"^\s*(?:\(|WITH\b.*?\)\s*)*(\w+)", _re.IGNORECASE | _re.DOTALL
+)
 _RETURNING_RE = _re.compile(r"\bRETURNING\b", _re.IGNORECASE)
+_ROW_RETURNING_KEYWORDS = frozenset({
+    "SELECT", "VALUES", "SHOW", "EXPLAIN", "FETCH", "TABLE",
+})
+_DML_KEYWORDS = frozenset({"INSERT", "UPDATE", "DELETE", "MERGE"})
 
 
 def _statement_returns_rows(sql: str) -> bool:
@@ -51,9 +60,9 @@ def _statement_returns_rows(sql: str) -> bool:
     Data API echoes ``columnMetadata`` for many INSERT/UPDATE/DELETE
     statements that have no result set — driving ``cursor.description``
     off it makes ``CursorResult.returns_rows`` lie. Use this as a
-    structural check: SELECT/VALUES/SHOW/EXPLAIN/FETCH always return
-    rows; INSERT/UPDATE/DELETE/MERGE return rows only when a RETURNING
-    clause is present.
+    structural check: SELECT/VALUES/SHOW/EXPLAIN/FETCH/TABLE always
+    return rows; INSERT/UPDATE/DELETE/MERGE return rows only when a
+    RETURNING clause is present.
     """
     if not sql:
         return False
@@ -61,9 +70,9 @@ def _statement_returns_rows(sql: str) -> bool:
     if not match:
         return False
     head = match.group(1).upper()
-    if head in {"SELECT", "VALUES", "SHOW", "EXPLAIN", "FETCH", "TABLE"}:
+    if head in _ROW_RETURNING_KEYWORDS:
         return True
-    if head in {"INSERT", "UPDATE", "DELETE", "MERGE"}:
+    if head in _DML_KEYWORDS:
         return bool(_RETURNING_RE.search(sql))
     return False
 
