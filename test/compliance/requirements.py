@@ -134,3 +134,17 @@ class Requirements(SuiteRequirements):
     @property
     def unique_index_reflect_as_unique_constraints(self):
         return exclusions.closed()
+
+    # ---- PostgreSQL features the suite gates behind requirements ----
+
+    @property
+    def supports_distinct_on(self):
+        # Inherited from PGDialect; the compile path emits
+        # ``SELECT DISTINCT ON (col)`` correctly. The default
+        # ``SuiteRequirements`` declares this ``closed()`` because the
+        # suite-shipped ``DistinctOnTest`` is structured as ``fails_if``
+        # this requirement — i.e. it expects to xfail on PG-style
+        # dialects. Without declaring this ``open()`` the test runs and
+        # fails because the PG-only deprecation warning correctly isn't
+        # emitted.
+        return exclusions.open()
