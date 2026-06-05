@@ -402,16 +402,30 @@ class AsyncAuroraDataAPICursor:
             rows.append(row)
         return rows
 
-    async def close(self):
+    def close(self):
+        """Sync close — pure in-memory state clear, no I/O.
+
+        The Aurora Data API is stateless on the wire (each
+        ``ExecuteStatement`` materializes its full result in the response);
+        nothing is allocated server-side that a close needs to free. So
+        this is just bookkeeping — clear the buffers, mirror what
+        ``_async_soft_close`` already did during the greenlet-spawned
+        drain — and stay sync so SQLAlchemy's pool / Result teardown can
+        call it from outside any greenlet without needing an event loop.
+
+        See SQLAlchemy's reference ``AsyncAdapt_dbapi_cursor.close`` for
+        the same shape; async work belongs in ``_async_soft_close`` only.
+        """
         self._current_response = None
         self._paging_state = None
-        self._buffer, self._buffer_idx = None, 0
+        self._buffer = None
+        self._buffer_idx = 0
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, err_type, value, traceback):
-        await self.close()
+        self.close()
 
     @property
     def rowcount(self):
@@ -489,36 +503,95 @@ class SyncAdaptedConnection:
         return self
 
 class SyncAdaptedCursor:
-    """Synchronous DB-API-ish cursor that forwards to the async cursor."""
+    """Synchronous DB-API-ish cursor that forwards to the async cursor.
+
+    SQLAlchemy 2.x's async-session execution path runs inside a greenlet
+    spawn so that this sync facade can call ``await_only(...)`` to bridge
+    back to the async cursor. After ``AsyncSession.execute()`` returns,
+    the caller is back on the asyncio event-loop side and is free to
+    iterate the returned ``Result`` — at which point the greenlet context
+    is gone. For INSERT/UPDATE/DELETE … RETURNING this matters: SQLAlchemy
+    will call ``cursor.fetchone()`` during iteration; if that ``fetchone``
+    tries ``await_only`` it raises ``MissingGreenlet``.
+
+    The fix is to materialize all RETURNING rows into a plain Python list
+    inside ``_async_soft_close`` (which SQLAlchemy invokes *while still*
+    in the greenlet, via ``_ensure_sync_result``). After draining,
+    subsequent ``fetchone``/``fetchmany``/``fetchall`` calls serve from
+    that buffer with no further async I/O.
+    """
     def __init__(self, async_cursor: AsyncAuroraDataAPICursor):
         self._cur = async_cursor
         self.arraysize = async_cursor.arraysize
         self.description = async_cursor.description
+        # Populated by `_async_soft_close` when SQLAlchemy drains a result
+        # set on the async path. None means "no drained rows; iterate
+        # against the async cursor via await_only".
+        self._drained_rows: list | None = None
 
     def execute(self, operation, parameters=None):
         await_only(self._cur.execute(operation, parameters))
         self.description = self._cur.description
+        self._drained_rows = None
         return self
 
     def executemany(self, operation, seq_of_parameters):
         await_only(self._cur.executemany(operation, seq_of_parameters))
         self.description = None
+        self._drained_rows = None
         return self
 
     def fetchone(self):
+        if self._drained_rows is not None:
+            if self._drained_rows:
+                return self._drained_rows.pop(0)
+            return None
         return await_only(self._cur.fetchone())
 
     def fetchmany(self, size=None):
+        if size is None:
+            size = self.arraysize
+        if self._drained_rows is not None:
+            out, self._drained_rows = self._drained_rows[:size], self._drained_rows[size:]
+            return out
         return await_only(self._cur.fetchmany(size))
 
     def fetchall(self):
+        if self._drained_rows is not None:
+            out, self._drained_rows = self._drained_rows, []
+            return out
         return await_only(self._cur.fetchall())
 
     def scroll(self, value, mode="relative"):
         return await_only(self._cur.scroll(value, mode))
 
     def close(self):
-        await_only(self._cur.close())
+        # AsyncAuroraDataAPICursor.close is sync (it does no I/O), so
+        # there's nothing to bridge here. SQLAlchemy's pool / Result
+        # teardown calls this outside any greenlet; that's fine because
+        # neither side needs an event loop. Genuine async cleanup that
+        # the result needed is already done by ``_async_soft_close``
+        # while we were in-spawn.
+        self._drained_rows = None
+        self._cur.close()
+
+    async def _async_soft_close(self):
+        """Called by SQLAlchemy's async result wrapper
+        (``_ensure_sync_result``) inside the greenlet that ran the
+        ``await session.execute(...)`` call. Drain every remaining row
+        into ``self._drained_rows`` so the caller can iterate the
+        returned ``Result`` synchronously without needing another
+        greenlet context — see the class docstring for the full story.
+        Then close the underlying async cursor.
+        """
+        rows = []
+        while True:
+            row = await self._cur.fetchone()
+            if row is None:
+                break
+            rows.append(row)
+        self._drained_rows = rows
+        self._cur.close()
 
     @property
     def rowcount(self):
