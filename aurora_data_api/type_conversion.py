@@ -44,6 +44,12 @@ _PG_TYPE_MAP = {
     "json": dict, "jsonb": dict,
     "money": str,
     "numeric": Decimal, "decimal": Decimal,
+    # PG-internal identifier types used heavily in pg_catalog reflection.
+    # Without these, Data API returns them as ``stringValue`` (the default
+    # path), so reflection round-trips (read oid -> pass back as parameter)
+    # turn into ``operator does not exist: oid = text`` errors.
+    "oid": int, "regproc": int, "regtype": int, "regclass": int,
+    "xid": int, "cid": int,
 }
 
 # PG types whose returned value represents a moment in time anchored to UTC.
@@ -120,6 +126,17 @@ def convert_value(value_dict, col_desc=None):
         return scalar
 
     tc = col_desc.type_code
+    # PG-internal identifier types (oid, regproc, regtype, regclass, xid, cid)
+    # arrive as ``stringValue`` over the Data API even though the column is
+    # logically an integer. Coerce so downstream callers — notably
+    # SQLAlchemy's reflection layer that round-trips oids straight back as
+    # query parameters — pass them as bigint, not text. Without this we get
+    # ``operator does not exist: oid = text`` on subsequent catalog queries.
+    if tc is int and isinstance(scalar, str):
+        try:
+            return int(scalar)
+        except (TypeError, ValueError):
+            return scalar
     # If the column's Python type suggests a string-encoded temporal/decimal, coerce
     if tc in _DATA_API_TYPE_HINT_MAP:
         if tc is Decimal:
