@@ -83,6 +83,45 @@ class Requirements(SuiteRequirements):
         # returns the expression as the column entry.
         return exclusions.open()
 
+    # ---- PG-supported expression / DDL features ----
+
+    @property
+    def supports_bitwise_and(self):
+        return exclusions.open()
+
+    @property
+    def supports_bitwise_or(self):
+        return exclusions.open()
+
+    @property
+    def supports_bitwise_xor(self):
+        return exclusions.open()
+
+    @property
+    def supports_bitwise_not(self):
+        return exclusions.open()
+
+    @property
+    def supports_bitwise_shift(self):
+        return exclusions.open()
+
+    @property
+    def datetime_literals(self):
+        # PG supports ``DATE 'YYYY-MM-DD'``, ``TIMESTAMP '...'`` etc.
+        return exclusions.open()
+
+    @property
+    def server_defaults(self):
+        # PG supports column-level DEFAULT and SA reflects via
+        # ``pg_attrdef``.
+        return exclusions.open()
+
+    @property
+    def view_column_reflection(self):
+        # PG reflects view columns via ``pg_get_viewdef`` and
+        # ``information_schema``.
+        return exclusions.open()
+
     @property
     def supports_distinct_on(self):
         # Inherited from PGDialect; the compile path emits
