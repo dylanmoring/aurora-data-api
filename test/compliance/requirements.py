@@ -41,6 +41,49 @@ class Requirements(SuiteRequirements):
         return exclusions.open()
 
     @property
+    def check_constraint_reflection(self):
+        # PG stores CHECK constraints in pg_constraint and SA's
+        # ``get_check_constraints`` reflects them. Both Aurora PG and
+        # the Data API path support this end-to-end.
+        return exclusions.open()
+
+    @property
+    def identity_columns(self):
+        # PG 10+ supports ``GENERATED ... AS IDENTITY``; Aurora PG 16.6
+        # of course does.
+        return exclusions.open()
+
+    @property
+    def identity_columns_standard(self):
+        return exclusions.open()
+
+    @property
+    def regexp_match(self):
+        # PG's ``~`` / ``~*`` operators.
+        return exclusions.open()
+
+    @property
+    def uuid_data_type(self):
+        # PG has a native ``uuid`` column type.
+        return exclusions.open()
+
+    @property
+    def materialized_views(self):
+        # PG ``CREATE MATERIALIZED VIEW``.
+        return exclusions.open()
+
+    @property
+    def index_reflects_included_columns(self):
+        # PG 11+ ``CREATE INDEX ... INCLUDE (col)``.
+        return exclusions.open()
+
+    @property
+    def reflect_indexes_with_expressions(self):
+        # PG supports expression indexes; SA's pg-side reflection
+        # returns the expression as the column entry.
+        return exclusions.open()
+
+    @property
     def supports_distinct_on(self):
         # Inherited from PGDialect; the compile path emits
         # ``SELECT DISTINCT ON (col)`` correctly. The default
