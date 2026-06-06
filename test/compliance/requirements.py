@@ -123,6 +123,49 @@ class Requirements(SuiteRequirements):
         return exclusions.open()
 
     @property
+    def view_reflection(self):
+        return exclusions.open()
+
+    @property
+    def views(self):
+        return exclusions.open()
+
+    @property
+    def inline_check_constraint_reflection(self):
+        return exclusions.open()
+
+    @property
+    def table_ddl_if_exists(self):
+        # PG ``CREATE TABLE IF NOT EXISTS`` / ``DROP TABLE IF EXISTS``.
+        return exclusions.open()
+
+    @property
+    def index_ddl_if_exists(self):
+        # PG ``CREATE INDEX IF NOT EXISTS`` / ``DROP INDEX IF EXISTS``.
+        return exclusions.open()
+
+    @property
+    def indexes_check_column_order(self):
+        # PG ``pg_index.indkey`` preserves column order; SA's reflection
+        # round-trips the order correctly.
+        return exclusions.open()
+
+    @property
+    def fetch_first(self):
+        # PG ``FETCH FIRST n ROWS ONLY``.
+        return exclusions.open()
+
+    @property
+    def fetch_ties(self):
+        # PG 13+ ``FETCH FIRST n ROWS WITH TIES``.
+        return exclusions.open()
+
+    @property
+    def fetch_offset_with_options(self):
+        return exclusions.open()
+
+
+    @property
     def supports_distinct_on(self):
         # Inherited from PGDialect; the compile path emits
         # ``SELECT DISTINCT ON (col)`` correctly. The default
