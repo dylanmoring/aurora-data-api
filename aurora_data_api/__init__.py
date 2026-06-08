@@ -18,6 +18,28 @@ threadsafety = 0
 paramstyle = "named"
 
 
+# DBAPI 2.0 type constructors. SQLAlchemy's PG dialect calls ``dbapi.Binary``
+# when binding ``LargeBinary`` values and probes other DBAPI type attrs
+# during bind processing — without these at module scope, the bind
+# processor raises ``AttributeError`` on the module before any query runs.
+# (Async driver carries the same set; keep them in sync.)
+Binary = bytes
+import datetime as _dt
+Date = _dt.date
+Time = _dt.time
+Timestamp = _dt.datetime
+DateFromTicks = _dt.date.fromtimestamp
+def TimeFromTicks(ticks):
+    return _dt.datetime.fromtimestamp(ticks).time()
+TimestampFromTicks = _dt.datetime.fromtimestamp
+STRING = str
+BINARY = bytes
+NUMBER = (int, float)
+DATETIME = _dt.datetime
+ROWID = int
+del _dt
+
+
 def _region_from_arn(arn: str) -> str:
     """Extract the AWS region segment from a cluster or secret ARN. Mirrors
     the helper on the async driver so both paths derive region the same way."""

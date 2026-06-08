@@ -46,6 +46,42 @@ apilevel = "2.0"
 threadsafety = 0 # DB-API meaning; async implies no cross-thread use of the same connection
 paramstyle = "named"
 
+# DBAPI 2.0 exception hierarchy. SQLAlchemy's ``Dialect.dbapi_exception_translator``
+# walks ``dbapi.IntegrityError``, ``dbapi.ProgrammingError``, etc. via isinstance
+# checks to pick the right ``sqlalchemy.exc.*`` subclass. Without these attrs
+# at module scope every error winds up as the generic ``DatabaseError`` and
+# application ``except IntegrityError`` blocks miss.
+from .exceptions.exceptions import (  # noqa: E402
+    Warning,
+    Error,
+    InterfaceError,
+    DatabaseError,
+    DataError,
+    OperationalError,
+    IntegrityError,
+    InternalError,
+    ProgrammingError,
+    NotSupportedError,
+)
+
+# DBAPI 2.0 type constructors. SQLAlchemy's PG dialect calls ``dbapi.Binary``
+# when binding a LargeBinary value; without these attrs the bind processor
+# raises ``AttributeError`` on the *module* before the query ever runs.
+Binary = bytes
+import datetime as _dt
+Date = _dt.date
+Time = _dt.time
+Timestamp = _dt.datetime
+DateFromTicks = _dt.date.fromtimestamp
+def TimeFromTicks(ticks):
+    return _dt.datetime.fromtimestamp(ticks).time()
+TimestampFromTicks = _dt.datetime.fromtimestamp
+STRING = str
+BINARY = bytes
+NUMBER = (int, float)
+DATETIME = _dt.datetime
+ROWID = int
+
 class AsyncAuroraDataAPIClient:
     """
     Async connection façade that mirrors the sync client but:
@@ -462,8 +498,17 @@ async def connect(
     database=None,
     charset=None,
     continue_after_timeout=None,
+    **_ignored,
 ):
-    region_name = region_name or _region_from_arn(aurora_cluster_arn or secret_arn)
+    # Mirror the sync ``connect``: when the URL doesn't carry the ARNs (the
+    # ``postgresql+auroradataapiasync://:@/<db>`` form we use for tests),
+    # fall back to env vars before deriving the region. The client
+    # constructor would do the env fallback for the ARNs themselves, but
+    # we need them in scope here to derive ``region_name``.
+    aurora_cluster_arn = aurora_cluster_arn or os.environ.get("AURORA_CLUSTER_ARN")
+    secret_arn = secret_arn or os.environ.get("AURORA_SECRET_ARN")
+    arn_for_region = aurora_cluster_arn or secret_arn
+    region_name = region_name or (_region_from_arn(arn_for_region) if arn_for_region else None)
     connection = AsyncAuroraDataAPIClient(
         dbname=database,
         aurora_cluster_arn=aurora_cluster_arn,
@@ -476,127 +521,58 @@ async def connect(
     return connection
 
 
-class SyncAdaptedConnection:
-    """Synchronous facade over AsyncAuroraDataAPIClient (for SQLAlchemy core)."""
-    def __init__(self, async_conn: AsyncAuroraDataAPIClient):
-        self._async = async_conn
+from sqlalchemy.connectors.asyncio import (
+    AsyncAdapt_dbapi_connection,
+    AsyncAdapt_dbapi_cursor,
+)
 
-    def cursor(self):
-        acur = await_only(self._async.cursor())
-        return SyncAdaptedCursor(acur)
 
-    # Transaction hooks invoked by SA dialect do_* methods
-    def start_transaction(self):
-        return await_only(self._async.start_transaction())
+class AuroraDataAPIAsyncAdaptCursor(AsyncAdapt_dbapi_cursor):
+    """SQLAlchemy AsyncAdapt cursor over :class:`AsyncAuroraDataAPICursor`.
 
-    def commit(self):
-        await_only(self._async.commit())
+    Inherits the greenlet bridging, result drain, and pool/teardown
+    boundary handling from ``AsyncAdapt_dbapi_cursor`` — the same base
+    class asyncpg and asyncmy use. We add only what differs:
 
-    def rollback(self):
-        await_only(self._async.rollback())
+    - ``_awaitable_cursor_close = False`` because Aurora Data API has no
+      server-side cursor state; ``AsyncAuroraDataAPICursor.close()`` is
+      sync in-memory bookkeeping, and SQLAlchemy's pool/Result teardown
+      paths can call it from outside the greenlet without needing an
+      event loop. (Asyncpg keeps the default ``True`` because its cursor
+      close sends a ``CLOSE`` for server-side portals.)
 
-    def close(self):
-        await_only(self._async.close())
-
-    @property
-    def connection(self):  # some SA code accesses .connection
-        return self
-
-class SyncAdaptedCursor:
-    """Synchronous DB-API-ish cursor that forwards to the async cursor.
-
-    SQLAlchemy 2.x's async-session execution path runs inside a greenlet
-    spawn so that this sync facade can call ``await_only(...)`` to bridge
-    back to the async cursor. After ``AsyncSession.execute()`` returns,
-    the caller is back on the asyncio event-loop side and is free to
-    iterate the returned ``Result`` — at which point the greenlet context
-    is gone. For INSERT/UPDATE/DELETE … RETURNING this matters: SQLAlchemy
-    will call ``cursor.fetchone()`` during iteration; if that ``fetchone``
-    tries ``await_only`` it raises ``MissingGreenlet``.
-
-    The fix is to materialize all RETURNING rows into a plain Python list
-    inside ``_async_soft_close`` (which SQLAlchemy invokes *while still*
-    in the greenlet, via ``_ensure_sync_result``). After draining,
-    subsequent ``fetchone``/``fetchmany``/``fetchall`` calls serve from
-    that buffer with no further async I/O.
+    - ``_make_new_cursor`` bridges the async cursor factory through
+      ``await_``. The underlying client's ``cursor()`` is async to allow
+      MySQL ``SET character_set_client`` on creation — even though that
+      path is unused for Postgres, the bridge keeps the two flavors
+      symmetric.
     """
-    def __init__(self, async_cursor: AsyncAuroraDataAPICursor):
-        self._cur = async_cursor
-        self.arraysize = async_cursor.arraysize
-        self.description = async_cursor.description
-        # Populated by `_async_soft_close` when SQLAlchemy drains a result
-        # set on the async path. None means "no drained rows; iterate
-        # against the async cursor via await_only".
-        self._drained_rows: list | None = None
 
-    def execute(self, operation, parameters=None):
-        await_only(self._cur.execute(operation, parameters))
-        self.description = self._cur.description
-        self._drained_rows = None
-        return self
+    _awaitable_cursor_close = False
 
-    def executemany(self, operation, seq_of_parameters):
-        await_only(self._cur.executemany(operation, seq_of_parameters))
-        self.description = None
-        self._drained_rows = None
-        return self
+    def _make_new_cursor(self, connection):
+        return self.await_(connection.cursor())
 
-    def fetchone(self):
-        if self._drained_rows is not None:
-            if self._drained_rows:
-                return self._drained_rows.pop(0)
-            return None
-        return await_only(self._cur.fetchone())
 
-    def fetchmany(self, size=None):
-        if size is None:
-            size = self.arraysize
-        if self._drained_rows is not None:
-            out, self._drained_rows = self._drained_rows[:size], self._drained_rows[size:]
-            return out
-        return await_only(self._cur.fetchmany(size))
+class AuroraDataAPIAsyncAdaptConnection(AsyncAdapt_dbapi_connection):
+    """SQLAlchemy AsyncAdapt connection over :class:`AsyncAuroraDataAPIClient`.
 
-    def fetchall(self):
-        if self._drained_rows is not None:
-            out, self._drained_rows = self._drained_rows, []
-            return out
-        return await_only(self._cur.fetchall())
+    Inherits ``commit`` / ``rollback`` / ``close`` / ``cursor`` from
+    ``AsyncAdapt_dbapi_connection``, which handles the greenlet bridge
+    and exception translation. We only add ``start_transaction`` because
+    the dialect's ``do_begin`` hook calls it explicitly.
+    """
 
-    def scroll(self, value, mode="relative"):
-        return await_only(self._cur.scroll(value, mode))
+    _cursor_cls = AuroraDataAPIAsyncAdaptCursor
 
-    def close(self):
-        # AsyncAuroraDataAPICursor.close is sync (it does no I/O), so
-        # there's nothing to bridge here. SQLAlchemy's pool / Result
-        # teardown calls this outside any greenlet; that's fine because
-        # neither side needs an event loop. Genuine async cleanup that
-        # the result needed is already done by ``_async_soft_close``
-        # while we were in-spawn.
-        self._drained_rows = None
-        self._cur.close()
+    def start_transaction(self):
+        try:
+            return self.await_(self._connection.start_transaction())
+        except Exception as error:
+            self._handle_exception(error)
 
-    async def _async_soft_close(self):
-        """Called by SQLAlchemy's async result wrapper
-        (``_ensure_sync_result``) inside the greenlet that ran the
-        ``await session.execute(...)`` call. Drain every remaining row
-        into ``self._drained_rows`` so the caller can iterate the
-        returned ``Result`` synchronously without needing another
-        greenlet context — see the class docstring for the full story.
-        Then close the underlying async cursor.
-        """
-        rows = []
-        while True:
-            row = await self._cur.fetchone()
-            if row is None:
-                break
-            rows.append(row)
-        self._drained_rows = rows
-        self._cur.close()
 
-    @property
-    def rowcount(self):
-        return self._cur.rowcount
-
-    @property
-    def lastrowid(self):
-        return self._cur.lastrowid
+# Note: the previous ``SyncAdaptedConnection`` / ``SyncAdaptedCursor``
+# hand-rolled facade is intentionally removed. The dialect must use
+# ``AuroraDataAPIAsyncAdaptConnection(dbapi, async_conn)`` going forward
+# — see the parallel update in the sqlalchemy-aurora-data-api fork.
