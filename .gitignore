@@ -30,3 +30,9 @@ npm-debug.log
 
 # OS X metadata files
 .DS_Store
+
+# SQLAlchemy compliance suite worktree additions
+.venv/
+.claude/
+test/.env
+test/**/*.log
