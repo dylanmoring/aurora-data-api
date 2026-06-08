@@ -40,6 +40,43 @@ ROWID = int
 del _dt
 
 
+import re as _re
+# Leading whitespace, optional ``(`` or ``WITH ... AS (...)`` prefix, then the
+# first keyword token. Handles ``(SELECT ...) UNION ...``,
+# ``WITH cte AS (...) SELECT ...``, and ordinary ``SELECT ...``.
+_LEADING_KEYWORD_RE = _re.compile(
+    r"^\s*(?:\(|WITH\b.*?\)\s*)*(\w+)", _re.IGNORECASE | _re.DOTALL
+)
+_RETURNING_RE = _re.compile(r"\bRETURNING\b", _re.IGNORECASE)
+_ROW_RETURNING_KEYWORDS = frozenset({
+    "SELECT", "VALUES", "SHOW", "EXPLAIN", "FETCH", "TABLE",
+})
+_DML_KEYWORDS = frozenset({"INSERT", "UPDATE", "DELETE", "MERGE"})
+
+
+def _statement_returns_rows(sql: str) -> bool:
+    """Return True if ``sql`` is expected to yield a result set.
+
+    Data API echoes ``columnMetadata`` for many INSERT/UPDATE/DELETE
+    statements that have no result set — driving ``cursor.description``
+    off it makes ``CursorResult.returns_rows`` lie. Use this as a
+    structural check: SELECT/VALUES/SHOW/EXPLAIN/FETCH/TABLE always
+    return rows; INSERT/UPDATE/DELETE/MERGE return rows only when a
+    RETURNING clause is present.
+    """
+    if not sql:
+        return False
+    match = _LEADING_KEYWORD_RE.match(sql)
+    if not match:
+        return False
+    head = match.group(1).upper()
+    if head in _ROW_RETURNING_KEYWORDS:
+        return True
+    if head in _DML_KEYWORDS:
+        return bool(_RETURNING_RE.search(sql))
+    return False
+
+
 def _region_from_arn(arn: str) -> str:
     """Extract the AWS region segment from a cluster or secret ARN. Mirrors
     the helper on the async driver so both paths derive region the same way."""
@@ -183,6 +220,11 @@ class AuroraDataAPICursor:
 
     @retry_exceptions(4, 2, 2, 4, exceptions="DatabaseResumingException")
     def execute(self, operation, parameters=None):
+        # SA reuses the same cursor across statements (e.g. a sequence
+        # ``nextval`` SELECT followed by the INSERT). Stale description
+        # from the previous SELECT would otherwise leak into the INSERT
+        # and flip ``CursorResult.returns_rows`` to True.
+        self.description = None
         self._current_response, self._iterator, self._paging_state = None, None, None
         self._buffer, self._buffer_idx = None, 0
         execute_statement_args: dict = dict(
@@ -196,7 +238,18 @@ class AuroraDataAPICursor:
         logger.debug("execute %s", reprlib.repr(operation.strip()))
         try:
             res = self._connection.client.execute_statement(**execute_statement_args)
-            if "columnMetadata" in res and not self.description:
+            # Data API echoes ``columnMetadata`` for many non-SELECT
+            # statements (e.g. plain INSERT without RETURNING) — the
+            # metadata describes the *table* shape, not a result set.
+            # If we set cursor.description from it, SQLAlchemy's
+            # ``CursorResult.returns_rows`` flips to True and downstream
+            # callers expect a row iterator that doesn't exist. Only
+            # populate description when the SQL actually returns rows
+            # (SELECT, or any DML with a RETURNING clause).
+            if (
+                "columnMetadata" in res
+                and _statement_returns_rows(operation)
+            ):
                 self._set_description(res["columnMetadata"])
             self._current_response = self._render_response(res)
             # Preload buffer for non-paginated responses
@@ -248,6 +301,11 @@ class AuroraDataAPICursor:
     @retry_exceptions(4, 2, 2, 4, exceptions="DatabaseResumingException")
     def executemany(self, operation, seq_of_parameters):
         # No autotransaction here either; batching is auto-committed unless outer tx active
+        # See ``execute`` for why we reset description here too: SA may
+        # have done a sequence ``nextval`` SELECT on this same cursor
+        # before calling executemany and we don't want that description
+        # to leak.
+        self.description = None
         logger.debug("executemany %s", reprlib.repr(operation.strip()))
         for batch in self._page_input(seq_of_parameters, page_size=self.arraysize):
             batch_execute_statement_args = dict(

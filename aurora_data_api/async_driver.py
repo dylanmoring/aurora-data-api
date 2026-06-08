@@ -34,6 +34,7 @@ from sqlalchemy.util.concurrency import await_only
 
 
 # Shared helpers from sync package
+from . import _statement_returns_rows
 from .type_conversion import build_description, format_parameters, convert_value
 from .exceptions import *
 from .retry import retry_exceptions
@@ -272,7 +273,13 @@ class AsyncAuroraDataAPICursor:
 
     @retry_exceptions(4, 2, 2, 4, exceptions="DatabaseResumingException")
     async def execute(self, operation, parameters=None):
-        # Reset per-exec state
+        # Reset per-exec state. ``description`` must reset too — SA
+        # reuses cursors across statements and stale description from a
+        # prior SELECT would otherwise leak into a subsequent INSERT and
+        # flip ``CursorResult.returns_rows`` to True. (See the
+        # ``_statement_returns_rows`` helper on the sync side for the
+        # symmetric fix.)
+        self.description = None
         self._current_response, self._paging_state = None, None
         self._buffer, self._buffer_idx = None, 0
 
@@ -288,7 +295,10 @@ class AsyncAuroraDataAPICursor:
         logger.debug("execute %s", reprlib.repr(operation.strip()))
         try:
             res = await self._connection.client.execute_statement(**execute_statement_args)
-            if "columnMetadata" in res and not self.description:
+            if (
+                "columnMetadata" in res
+                and _statement_returns_rows(operation)
+            ):
                 self._set_description(res["columnMetadata"])
             self._current_response = self._render_response(res)
             # Preload buffer for non-paginated responses
@@ -318,6 +328,9 @@ class AsyncAuroraDataAPICursor:
 
     @retry_exceptions(4, 2, 2, 4, exceptions="DatabaseResumingException")
     async def executemany(self, operation, seq_of_parameters):
+        # Mirror execute()'s description reset — SA may have done a
+        # sequence nextval on this same cursor right before.
+        self.description = None
         logger.debug("executemany %s", reprlib.repr(operation.strip()))
         for batch in self._page_input(seq_of_parameters, page_size=self.arraysize):
             batch_args = dict(
