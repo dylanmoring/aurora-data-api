@@ -176,3 +176,81 @@ class Requirements(SuiteRequirements):
         # fails because the PG-only deprecation warning correctly isn't
         # emitted.
         return exclusions.open()
+
+    # ---- Additional PG-supported features the generic baseline closes ----
+
+    @property
+    def regexp_replace(self):
+        # PG ``regexp_replace(text, pattern, replacement [, flags])``.
+        return exclusions.open()
+
+    @property
+    def tuple_in(self):
+        # PG ``(a, b) IN ((1, 2), (3, 4))``.
+        return exclusions.open()
+
+    @property
+    def tuple_in_w_empty(self):
+        # PG handles empty tuple IN via SA's compile rewrite.
+        return exclusions.open()
+
+    # NOTE: temp_table_names / temp_table_comment_reflection stay closed.
+    # Aurora Data API is stateless HTTPS — each call gets a fresh
+    # session, so PG temp tables (relpersistence='t') created in one
+    # call aren't visible from another. Opening these requirements
+    # cascades into ~50 reflection failures.
+
+    @property
+    def cross_schema_fk_reflection(self):
+        # PG allows FK referencing other schemas; SA reflects via
+        # ``pg_constraint.confrelid``.
+        return exclusions.open()
+
+    # NOTE: column_collation_reflection / order_by_collation stay closed.
+    # Aurora PG's default collation handling apparently differs from
+    # what the suite expects (or requires named collations to be
+    # available in our database) — opening them gives 1-2 failures.
+
+    @property
+    def indexes_with_expressions(self):
+        # PG ``CREATE INDEX ON tab ((lower(col)))`` — expression indexes.
+        return exclusions.open()
+
+    # NOTE: infinity_floats left closed — PG supports Inf, but the
+    # Data API ``doubleValue`` field can't carry IEEE Inf in JSON
+    # (it serialises to ``Infinity`` which isn't valid JSON), so the
+    # value round-trips broken.
+
+    @property
+    def precision_numerics_many_significant_digits(self):
+        # PG ``NUMERIC`` supports arbitrary precision.
+        return exclusions.open()
+
+    @property
+    def precision_numerics_retains_significant_digits(self):
+        return exclusions.open()
+
+    @property
+    def schema_create_delete(self):
+        # PG ``CREATE SCHEMA`` / ``DROP SCHEMA``.
+        return exclusions.open()
+
+    @property
+    def fk_constraint_option_reflection_ondelete_restrict(self):
+        return exclusions.open()
+
+    @property
+    def fk_constraint_option_reflection_ondelete_noaction(self):
+        return exclusions.open()
+
+    @property
+    def fk_constraint_option_reflection_onupdate_restrict(self):
+        return exclusions.open()
+
+    @property
+    def fk_constraint_option_reflection_ondelete_default(self):
+        return exclusions.open()
+
+    @property
+    def fk_constraint_option_reflection_ondelete_set_default(self):
+        return exclusions.open()
