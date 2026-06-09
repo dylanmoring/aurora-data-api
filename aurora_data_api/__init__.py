@@ -1,11 +1,19 @@
 """
 aurora-data-api - A Python DB-API 2.0 client for the AWS Aurora Serverless Data API
 """
-import os, time, random, string, logging, itertools, reprlib, threading
+import os, time, random, string, logging, itertools, reprlib, threading, re
 
 import boto3
 
-from .type_conversion import build_description, format_parameters, convert_value
+from .type_conversion import (
+    build_description, format_parameters, convert_value,
+    # DB-API 2.0 type objects/constructors. Re-exported at module scope (and
+    # imported from here by the async driver) because SQLAlchemy's PG dialect
+    # probes them — e.g. ``dbapi.Binary`` when binding ``LargeBinary`` — during
+    # bind processing, before any query runs. Defined once in type_conversion.
+    Binary, Date, Time, Timestamp, DateFromTicks, TimeFromTicks,
+    TimestampFromTicks, STRING, BINARY, NUMBER, DATETIME, ROWID,
+)
 from .exceptions import *
 from .retry import retry_exceptions
 
@@ -18,36 +26,13 @@ threadsafety = 0
 paramstyle = "named"
 
 
-# DBAPI 2.0 type constructors. SQLAlchemy's PG dialect calls ``dbapi.Binary``
-# when binding ``LargeBinary`` values and probes other DBAPI type attrs
-# during bind processing — without these at module scope, the bind
-# processor raises ``AttributeError`` on the module before any query runs.
-# (The async driver imports this same set from here — see async_driver.py.)
-Binary = bytes
-import datetime as _dt
-Date = _dt.date
-Time = _dt.time
-Timestamp = _dt.datetime
-DateFromTicks = _dt.date.fromtimestamp
-def TimeFromTicks(ticks):
-    return _dt.datetime.fromtimestamp(ticks).time()
-TimestampFromTicks = _dt.datetime.fromtimestamp
-STRING = str
-BINARY = bytes
-NUMBER = (int, float)
-DATETIME = _dt.datetime
-ROWID = int
-# NB: keep ``_dt`` bound — ``TimeFromTicks`` references it at call time.
-
-
-import re as _re
 # Leading whitespace, optional ``(`` or ``WITH ... AS (...)`` prefix, then the
 # first keyword token. Handles ``(SELECT ...) UNION ...``,
 # ``WITH cte AS (...) SELECT ...``, and ordinary ``SELECT ...``.
-_LEADING_KEYWORD_RE = _re.compile(
-    r"^\s*(?:\(|WITH\b.*?\)\s*)*(\w+)", _re.IGNORECASE | _re.DOTALL
+_LEADING_KEYWORD_RE = re.compile(
+    r"^\s*(?:\(|WITH\b.*?\)\s*)*(\w+)", re.IGNORECASE | re.DOTALL
 )
-_RETURNING_RE = _re.compile(r"\bRETURNING\b", _re.IGNORECASE)
+_RETURNING_RE = re.compile(r"\bRETURNING\b", re.IGNORECASE)
 _ROW_RETURNING_KEYWORDS = frozenset({
     "SELECT", "VALUES", "SHOW", "EXPLAIN", "FETCH", "TABLE",
 })

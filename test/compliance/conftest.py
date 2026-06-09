@@ -25,27 +25,11 @@ The driver picks up ``AURORA_CLUSTER_ARN`` / ``AURORA_SECRET_ARN`` from
 URL itself is just the empty-credentials form
 ``postgresql+auroradataapiasync://:@/<dbname>``.
 """
-import os
-from pathlib import Path
-
 import pytest
 
+from test import load_dotenv
 
-def _load_dotenv() -> None:
-    # ``.env`` lives at ``test/.env`` (one level up) and is shared by
-    # the compliance + integration suites.
-    env_path = Path(__file__).parent.parent / ".env"
-    if not env_path.exists():
-        return
-    for raw in env_path.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        os.environ.setdefault(k.strip(), v.strip())
-
-
-_load_dotenv()
+load_dotenv()
 
 
 def _patch_testing_engine_for_async() -> None:
@@ -122,12 +106,10 @@ pytest.register_assert_rewrite("sqlalchemy.testing.assertions")
 from sqlalchemy.testing.plugin.pytestplugin import *  # noqa: E402, F401, F403
 
 
-_plugin_pytest_configure = pytest_configure  # noqa: F405
+# ``pytest_configure`` is left to the star-imported plugin hook — we add
+# nothing to it. Only ``pytest_sessionstart`` needs extending, so capture the
+# plugin's version and call through.
 _plugin_pytest_sessionstart = pytest_sessionstart  # noqa: F405
-
-
-def pytest_configure(config):
-    _plugin_pytest_configure(config)
 
 
 def pytest_sessionstart(session):

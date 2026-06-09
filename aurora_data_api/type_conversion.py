@@ -8,18 +8,23 @@ from collections.abc import Mapping
 
 from .exceptions import NotSupportedError
 
+# DB-API 2.0 type objects / constructors. Defined once here (the module that
+# owns the type machinery) and re-exported by the package ``__init__`` and the
+# async driver, because SQLAlchemy's PG dialect probes them as module attrs
+# during bind processing.
 Date = datetime.date
 Time = datetime.time
 Timestamp = datetime.datetime
 DateFromTicks = datetime.date.fromtimestamp
-# TimeFromTicks = datetime.time.fromtimestamp TODO
+def TimeFromTicks(ticks):
+    return datetime.datetime.fromtimestamp(ticks).time()
 TimestampFromTicks = datetime.datetime.fromtimestamp
 Binary = bytes
 STRING = str
 BINARY = bytes
-NUMBER = float
+NUMBER = (int, float)
 DATETIME = datetime.datetime
-ROWID = str
+ROWID = int
 DECIMAL = Decimal
 
 ColumnDescription = namedtuple(
@@ -77,6 +82,11 @@ _DATA_API_TYPE_HINT_MAP = {
     Decimal: "DECIMAL",
 }
 
+# Logical types that the Data API returns as ``stringValue`` but that
+# ``type_code(scalar)`` coerces straight back to the native value (see
+# ``convert_value``). Add a type here when a new string-backed scalar appears.
+_STRING_SCALAR_COERCIONS = frozenset({int, uuid.UUID})
+
 def build_description(column_metadata):
     """Return DB-API description list from column metadata."""
     desc = []
@@ -126,26 +136,17 @@ def convert_value(value_dict, col_desc=None):
         return scalar
 
     tc = col_desc.type_code
-    # PG-internal identifier types (oid, regproc, regtype, regclass, xid, cid)
-    # arrive as ``stringValue`` over the Data API even though the column is
-    # logically an integer. Coerce so downstream callers — notably
-    # SQLAlchemy's reflection layer that round-trips oids straight back as
-    # query parameters — pass them as bigint, not text. Without this we get
-    # ``operator does not exist: oid = text`` on subsequent catalog queries.
-    if tc is int and isinstance(scalar, str):
+    # Some columns whose logical Python type is ``int``/``uuid.UUID`` arrive as
+    # ``stringValue`` over the Data API: PG-internal identifier types (oid,
+    # regproc, regtype, regclass, xid, cid) and UUID columns. Coerce via the
+    # column's own type so downstream callers get the native value — e.g.
+    # SQLAlchemy's reflection layer round-trips oids straight back as query
+    # parameters (text would give ``operator does not exist: oid = text``),
+    # and ``UUID(as_uuid=True)`` columns expect a real ``uuid.UUID``, matching
+    # psycopg2 / asyncpg. New string-backed scalar types just join the set.
+    if isinstance(scalar, str) and tc in _STRING_SCALAR_COERCIONS:
         try:
-            return int(scalar)
-        except (TypeError, ValueError):
-            return scalar
-    # UUID columns arrive as ``stringValue`` too. SQLAlchemy's PG ``UUID``
-    # type expects the DBAPI to return ``uuid.UUID`` (or a string the
-    # default result processor parses — but our description-driven path
-    # bypasses that). Coerce here so application code that types columns
-    # as ``UUID(as_uuid=True)`` gets a real ``uuid.UUID`` rather than a
-    # string, matching psycopg2 / asyncpg behavior.
-    if tc is uuid.UUID and isinstance(scalar, str):
-        try:
-            return uuid.UUID(scalar)
+            return tc(scalar)
         except (TypeError, ValueError):
             return scalar
     # If the column's Python type suggests a string-encoded temporal/decimal, coerce

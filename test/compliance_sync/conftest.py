@@ -12,25 +12,11 @@ needed, both for genuine Aurora Data API plumbing (`test_schema`
 provisioning + the canonical conftest idiom). All async-engine plumbing
 from the sister conftest is unnecessary here.
 """
-import os
-from pathlib import Path
-
 import pytest
 
+from test import load_dotenv
 
-def _load_dotenv() -> None:
-    env_path = Path(__file__).parent.parent / ".env"
-    if not env_path.exists():
-        return
-    for raw in env_path.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        os.environ.setdefault(k.strip(), v.strip())
-
-
-_load_dotenv()
+load_dotenv()
 
 
 def _patch_pg_post_configure_to_create_schemas() -> None:
@@ -71,19 +57,9 @@ registry.register(
 )
 
 
-# Canonical third-party-dialect idiom (per README.dialects.rst).
+# Canonical third-party-dialect idiom (per README.dialects.rst). The star
+# import binds the plugin's ``pytest_configure`` / ``pytest_sessionstart``
+# hooks into this conftest's namespace, where pytest discovers them directly —
+# we add no behavior of our own, so there's nothing to wrap.
 pytest.register_assert_rewrite("sqlalchemy.testing.assertions")
 from sqlalchemy.testing.plugin.pytestplugin import *  # noqa: E402, F401, F403
-
-
-# Capture the plugin's hooks before we shadow them via local redefinition.
-_plugin_pytest_configure = pytest_configure  # noqa: F405
-_plugin_pytest_sessionstart = pytest_sessionstart  # noqa: F405
-
-
-def pytest_configure(config):
-    _plugin_pytest_configure(config)
-
-
-def pytest_sessionstart(session):
-    _plugin_pytest_sessionstart(session)

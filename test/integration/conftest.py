@@ -17,9 +17,6 @@ production code uses it. That's the point: stress the integration
 between SQLAlchemy's async surface and our specific driver / Aurora
 Data API, in shapes the application actually uses.
 """
-import os
-from pathlib import Path
-
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -33,19 +30,9 @@ registry.register(
 )
 
 
-def _load_dotenv() -> None:
-    env_path = Path(__file__).parent.parent / ".env"
-    if not env_path.exists():
-        return
-    for raw in env_path.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        os.environ.setdefault(k.strip(), v.strip())
+from test import load_dotenv
 
-
-_load_dotenv()
+load_dotenv()
 
 
 # pytest-asyncio config (asyncio_default_*_loop_scope = session in setup.cfg)

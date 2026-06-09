@@ -38,6 +38,7 @@ import aioboto3
 # module during bind processing, so they must be in scope here too.
 from . import (
     _statement_returns_rows,
+    _region_from_arn,
     Binary,
     Date,
     Time,
@@ -482,9 +483,6 @@ class AsyncAuroraDataAPICursor:
 
 
 
-
-def _region_from_arn(arn: str) -> str:
-    return arn.split(":")[3]
 
 async def connect(
     *,
