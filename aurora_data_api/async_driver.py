@@ -10,8 +10,10 @@ Design goals (parallel to sync driver):
 - aioboto3 lifecycle managed with async context manager.
 
 
-This module is designed to work with an async SQLAlchemy dialect that adapts
-this async client to a sync-looking facade via await_only (see SyncAdaptedConnection below).
+This module is designed to work with an async SQLAlchemy dialect. The async
+client is adapted to SQLAlchemy's sync-facing DBAPI contract via the
+``AsyncAdapt_dbapi_*`` base classes (see ``AuroraDataAPIAsyncAdaptConnection``
+below), which bridge sync calls back to the event loop with greenlets.
 """
 from __future__ import annotations
 
@@ -30,12 +32,31 @@ from typing import Optional, Any, List
 import aioboto3
 
 
-from sqlalchemy.util.concurrency import await_only
-
-
-# Shared helpers from sync package
-from . import _statement_returns_rows
+# Shared helpers and DBAPI module-level attrs from the sync package. The type
+# constructors (``Binary``, ``Date``, …) live in the sync package so both
+# drivers expose one definition; SQLAlchemy's PG dialect reads them off this
+# module during bind processing, so they must be in scope here too.
+from . import (
+    _statement_returns_rows,
+    Binary,
+    Date,
+    Time,
+    Timestamp,
+    DateFromTicks,
+    TimeFromTicks,
+    TimestampFromTicks,
+    STRING,
+    BINARY,
+    NUMBER,
+    DATETIME,
+    ROWID,
+)
 from .type_conversion import build_description, format_parameters, convert_value
+# Star-import also binds the DBAPI exception hierarchy (Warning, Error,
+# IntegrityError, ProgrammingError, …) at module scope. SQLAlchemy's
+# ``Dialect.dbapi_exception_translator`` walks those attrs via isinstance to
+# pick the right ``sqlalchemy.exc.*`` subclass; without them every error winds
+# up as the generic ``DatabaseError`` and ``except IntegrityError`` blocks miss.
 from .exceptions import *
 from .retry import retry_exceptions
 
@@ -47,41 +68,6 @@ apilevel = "2.0"
 threadsafety = 0 # DB-API meaning; async implies no cross-thread use of the same connection
 paramstyle = "named"
 
-# DBAPI 2.0 exception hierarchy. SQLAlchemy's ``Dialect.dbapi_exception_translator``
-# walks ``dbapi.IntegrityError``, ``dbapi.ProgrammingError``, etc. via isinstance
-# checks to pick the right ``sqlalchemy.exc.*`` subclass. Without these attrs
-# at module scope every error winds up as the generic ``DatabaseError`` and
-# application ``except IntegrityError`` blocks miss.
-from .exceptions.exceptions import (  # noqa: E402
-    Warning,
-    Error,
-    InterfaceError,
-    DatabaseError,
-    DataError,
-    OperationalError,
-    IntegrityError,
-    InternalError,
-    ProgrammingError,
-    NotSupportedError,
-)
-
-# DBAPI 2.0 type constructors. SQLAlchemy's PG dialect calls ``dbapi.Binary``
-# when binding a LargeBinary value; without these attrs the bind processor
-# raises ``AttributeError`` on the *module* before the query ever runs.
-Binary = bytes
-import datetime as _dt
-Date = _dt.date
-Time = _dt.time
-Timestamp = _dt.datetime
-DateFromTicks = _dt.date.fromtimestamp
-def TimeFromTicks(ticks):
-    return _dt.datetime.fromtimestamp(ticks).time()
-TimestampFromTicks = _dt.datetime.fromtimestamp
-STRING = str
-BINARY = bytes
-NUMBER = (int, float)
-DATETIME = _dt.datetime
-ROWID = int
 
 class AsyncAuroraDataAPIClient:
     """
@@ -295,10 +281,7 @@ class AsyncAuroraDataAPICursor:
         logger.debug("execute %s", reprlib.repr(operation.strip()))
         try:
             res = await self._connection.client.execute_statement(**execute_statement_args)
-            if (
-                "columnMetadata" in res
-                and _statement_returns_rows(operation)
-            ):
+            if "columnMetadata" in res and _statement_returns_rows(operation):
                 self._set_description(res["columnMetadata"])
             self._current_response = self._render_response(res)
             # Preload buffer for non-paginated responses
@@ -574,6 +557,9 @@ class AuroraDataAPIAsyncAdaptConnection(AsyncAdapt_dbapi_connection):
     ``AsyncAdapt_dbapi_connection``, which handles the greenlet bridge
     and exception translation. We only add ``start_transaction`` because
     the dialect's ``do_begin`` hook calls it explicitly.
+
+    The dialect constructs this as
+    ``AuroraDataAPIAsyncAdaptConnection(dbapi, async_conn)``.
     """
 
     _cursor_cls = AuroraDataAPIAsyncAdaptCursor
@@ -583,9 +569,3 @@ class AuroraDataAPIAsyncAdaptConnection(AsyncAdapt_dbapi_connection):
             return self.await_(self._connection.start_transaction())
         except Exception as error:
             self._handle_exception(error)
-
-
-# Note: the previous ``SyncAdaptedConnection`` / ``SyncAdaptedCursor``
-# hand-rolled facade is intentionally removed. The dialect must use
-# ``AuroraDataAPIAsyncAdaptConnection(dbapi, async_conn)`` going forward
-# — see the parallel update in the sqlalchemy-aurora-data-api fork.

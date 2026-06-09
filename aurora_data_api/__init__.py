@@ -22,7 +22,7 @@ paramstyle = "named"
 # when binding ``LargeBinary`` values and probes other DBAPI type attrs
 # during bind processing — without these at module scope, the bind
 # processor raises ``AttributeError`` on the module before any query runs.
-# (Async driver carries the same set; keep them in sync.)
+# (The async driver imports this same set from here — see async_driver.py.)
 Binary = bytes
 import datetime as _dt
 Date = _dt.date
@@ -37,7 +37,7 @@ BINARY = bytes
 NUMBER = (int, float)
 DATETIME = _dt.datetime
 ROWID = int
-del _dt
+# NB: keep ``_dt`` bound — ``TimeFromTicks`` references it at call time.
 
 
 import re as _re
@@ -246,10 +246,7 @@ class AuroraDataAPICursor:
             # callers expect a row iterator that doesn't exist. Only
             # populate description when the SQL actually returns rows
             # (SELECT, or any DML with a RETURNING clause).
-            if (
-                "columnMetadata" in res
-                and _statement_returns_rows(operation)
-            ):
+            if "columnMetadata" in res and _statement_returns_rows(operation):
                 self._set_description(res["columnMetadata"])
             self._current_response = self._render_response(res)
             # Preload buffer for non-paginated responses
