@@ -313,8 +313,13 @@ class Requirements(SuiteRequirements):
 
     @property
     def unicode_ddl(self):
-        # PG handles unicode identifiers natively.
-        return exclusions.open()
+        # PG handles unicode identifiers natively, but the Data API
+        # rejects any named parameter outside ``[A-Za-z0-9_]`` with
+        # ``ValidationException: Named parameter syntax is invalid,
+        # input: <name>``. SA binds reflection lookups by the
+        # identifier itself, so a column named ``mäil`` produces a
+        # bind name with non-ASCII chars that the service refuses.
+        return exclusions.closed()
 
     @property
     def window_functions(self):
@@ -346,11 +351,32 @@ class Requirements(SuiteRequirements):
 
     @property
     def array_type(self):
-        # PG native ARRAY. Worth a try; may surface JSON-array
-        # serialization gaps in the Data API.
-        return exclusions.open()
+        # PG native ARRAY. Binding now works for both single-dim and
+        # multi-dim arrays (driver serialises lists as the Data API's
+        # ``arrayValue`` with nested ``arrayValues`` for multi-dim).
+        # But the Data API service itself raises
+        # ``UnsupportedResultException: The result contains a
+        # multidimensional array`` when a SELECT returns one, so the
+        # round-trip is dead at the wire format. SA's compliance
+        # ``ArrayTest`` uses multi-dim columns in 2 of 3 tests, so
+        # opening this gives 1 pass + 2 fails rather than 3 clean
+        # skips. Keep closed until either the Data API grows multi-dim
+        # support or we ship a PG-array-aware test subclass.
+        return exclusions.closed()
 
     @property
     def empty_inserts(self):
         # PG ``INSERT INTO t DEFAULT VALUES``.
         return exclusions.open()
+
+    @property
+    def datetime_implicit_bound(self):
+        # ``SELECT literal(<tz_aware_datetime>)`` -- the test sends
+        # ``self.data`` as a bind with no explicit CAST. The Data API's
+        # typeHint enum has no TIMESTAMPTZ (only TIMESTAMP), so PG
+        # serves the result column as ``timestamp`` not ``timestamptz``;
+        # by the time it lands in convert_value the tzinfo is gone on
+        # the wire and we have nothing to attach UTC to. Real columns
+        # of ``TIMESTAMP WITH TIME ZONE`` still round-trip correctly --
+        # the bug only affects ``literal()`` selects.
+        return exclusions.closed()
