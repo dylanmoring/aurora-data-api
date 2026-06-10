@@ -68,7 +68,7 @@ from sqlalchemy.testing.plugin.pytestplugin import *  # noqa: E402, F401, F403
 # the specific DifficultParametersTest combinations that can't pass.
 _DATA_API_REJECTED_PARAM_CHARS = ("/slashes/", "more/slashes", "q?marks")
 # Tests the Data API service contract fundamentally can't satisfy.
-_DATA_API_INCOMPATIBLE_TESTS = ("test_round_trip_custom_json",)
+_DATA_API_INCOMPATIBLE_TESTS = ()
 
 
 def pytest_collection_modifyitems(config, items):

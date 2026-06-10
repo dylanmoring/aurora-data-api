@@ -371,12 +371,10 @@ class Requirements(SuiteRequirements):
 
     @property
     def datetime_implicit_bound(self):
-        # ``SELECT literal(<tz_aware_datetime>)`` -- the test sends
-        # ``self.data`` as a bind with no explicit CAST. The Data API's
-        # typeHint enum has no TIMESTAMPTZ (only TIMESTAMP), so PG
-        # serves the result column as ``timestamp`` not ``timestamptz``;
-        # by the time it lands in convert_value the tzinfo is gone on
-        # the wire and we have nothing to attach UTC to. Real columns
-        # of ``TIMESTAMP WITH TIME ZONE`` still round-trip correctly --
-        # the bug only affects ``literal()`` selects.
-        return exclusions.closed()
+        # The dialect's ``_ADA_DATETIME_MIXIN.bind_expression`` casts each
+        # datetime bind to ``self`` (the type INSTANCE, so ``timezone=True``
+        # survives), rendering ``CAST(:p AS TIMESTAMP WITH TIME ZONE)`` --
+        # that explicit cast stands in for the TIMESTAMPTZ typeHint the
+        # Data API enum lacks, so ``select(literal(<tz_aware>))`` now
+        # round-trips with tzinfo intact.
+        return exclusions.open()

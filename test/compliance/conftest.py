@@ -119,14 +119,7 @@ _DATA_API_REJECTED_PARAM_CHARS = ("/slashes/", "more/slashes", "q?marks")
 # fundamentally can't satisfy. Deselected rather than xfailed so they
 # stay visible in the count and don't quietly succeed in some future
 # state.
-_DATA_API_INCOMPATIBLE_TESTS = (
-    # Data API canonicalises JSON values on the wire -- whitespace and
-    # key ordering are mangled. The test asserts the user's custom
-    # deserializer is called with the EXACT original JSON text, which
-    # the service breaks. JSON columns still work end-to-end (other
-    # 90+ JSONTest cases pass); only this mock-assertion-on-text fails.
-    "test_round_trip_custom_json",
-)
+_DATA_API_INCOMPATIBLE_TESTS = ()
 
 
 def pytest_collection_modifyitems(config, items):
