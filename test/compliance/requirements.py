@@ -103,7 +103,13 @@ class Requirements(SuiteRequirements):
 
     @property
     def supports_bitwise_shift(self):
-        return exclusions.open()
+        # PG defines ``int4 << int4`` but not ``int4 << int8``. The Data
+        # API serialises every Python ``int`` as ``longValue`` (= bigint
+        # at the PG level), so ``column << :param`` lands as
+        # ``integer << bigint`` and PG raises
+        # ``operator does not exist: integer << bigint``. ``and/or/xor/not``
+        # don't have the int4/int8 split, so those stay open above.
+        return exclusions.closed()
 
     @property
     def datetime_literals(self):
@@ -194,11 +200,26 @@ class Requirements(SuiteRequirements):
         # PG handles empty tuple IN via SA's compile rewrite.
         return exclusions.open()
 
-    # NOTE: temp_table_names / temp_table_comment_reflection stay closed.
     # Aurora Data API is stateless HTTPS — each call gets a fresh
     # session, so PG temp tables (relpersistence='t') created in one
-    # call aren't visible from another. Opening these requirements
-    # cascades into ~50 reflection failures.
+    # call aren't visible from the next. The SuiteRequirements default
+    # opens ``temp_table_reflection``; close it for us so the
+    # temp-table reflection tests skip rather than fail with
+    # ``NoSuchTableError: user_tmp_main``.
+    @property
+    def temp_table_reflection(self):
+        return exclusions.closed()
+
+    @property
+    def reflects_pk_names(self):
+        # PG's pg_constraint reflects PK constraint names verbatim;
+        # SA's get_pk_constraint returns them. The base default is
+        # closed() (generic baseline), so the suite's
+        # ``test_get_pk_constraint`` wraps the assertion in
+        # ``requires.reflects_pk_names.fail_if()`` -- when the assertion
+        # passes anyway (we DO reflect names), exclusions raises
+        # ``Unexpected success for 'block' (marked as skip)``.
+        return exclusions.open()
 
     @property
     def cross_schema_fk_reflection(self):
@@ -253,4 +274,83 @@ class Requirements(SuiteRequirements):
 
     @property
     def fk_constraint_option_reflection_ondelete_set_default(self):
+        return exclusions.open()
+
+    # ---- PG-supported requirements left closed in the base
+    # SuiteRequirements; opening these exposes 200+ tests that the PG
+    # dialect compiles correctly and that the Data API can carry
+    # (modulo driver-level gaps surfaced by these runs) ----
+
+    @property
+    def json_type(self):
+        # PG has native ``json`` and ``jsonb``. The PG dialect compiles
+        # ``Column(JSON)`` to ``json``; whether the Data API wire format
+        # round-trips it is what these 99 tests exercise.
+        return exclusions.open()
+
+    @property
+    def ctes(self):
+        # PG supports WITH RECURSIVE.
+        return exclusions.open()
+
+    @property
+    def ctes_with_update_delete(self):
+        return exclusions.open()
+
+    @property
+    def ctes_on_dml(self):
+        return exclusions.open()
+
+    @property
+    def datetime_timezone(self):
+        # PG ``TIMESTAMP WITH TIME ZONE`` / ``TIME WITH TIME ZONE``.
+        return exclusions.open()
+
+    @property
+    def timestamp_microseconds(self):
+        # PG TIMESTAMP carries microseconds.
+        return exclusions.open()
+
+    @property
+    def unicode_ddl(self):
+        # PG handles unicode identifiers natively.
+        return exclusions.open()
+
+    @property
+    def window_functions(self):
+        # PG supports OVER() / PARTITION BY etc.
+        return exclusions.open()
+
+    @property
+    def computed_columns(self):
+        # PG 12+ supports ``GENERATED ALWAYS AS (...) STORED``. Aurora PG
+        # 16.6 has them.
+        return exclusions.open()
+
+    @property
+    def computed_columns_reflect_persisted(self):
+        return exclusions.open()
+
+    @property
+    def computed_columns_default_persisted(self):
+        return exclusions.open()
+
+    @property
+    def computed_columns_stored(self):
+        return exclusions.open()
+
+    @property
+    def values_expression(self):
+        # PG ``VALUES (...) AS t(col1, col2)``.
+        return exclusions.open()
+
+    @property
+    def array_type(self):
+        # PG native ARRAY. Worth a try; may surface JSON-array
+        # serialization gaps in the Data API.
+        return exclusions.open()
+
+    @property
+    def empty_inserts(self):
+        # PG ``INSERT INTO t DEFAULT VALUES``.
         return exclusions.open()

@@ -106,6 +106,29 @@ pytest.register_assert_rewrite("sqlalchemy.testing.assertions")
 from sqlalchemy.testing.plugin.pytestplugin import *  # noqa: E402, F401, F403
 
 
+# The AWS Data API rejects any named-parameter identifier outside
+# ``[A-Za-z_][A-Za-z0-9_]*`` with ``ValidationException: Named parameter
+# syntax is invalid, input: <name>``. The compliance suite's
+# ``DifficultParametersTest`` parametrises on names like ``/slashes/``,
+# ``more/slashes``, ``q?marks`` -- these can't pass against the Data API
+# at all. Deselect just those combinations; the in-spec names (per-cent,
+# colons, dots, parens, underscores) stay in.
+_DATA_API_REJECTED_PARAM_CHARS = ("/slashes/", "more/slashes", "q?marks")
+
+
+def pytest_collection_modifyitems(config, items):
+    keep = []
+    deselected = []
+    for item in items:
+        if any(f"[{p}]" in item.name for p in _DATA_API_REJECTED_PARAM_CHARS):
+            deselected.append(item)
+        else:
+            keep.append(item)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = keep
+
+
 # ``pytest_configure`` is left to the star-imported plugin hook — we add
 # nothing to it. Only ``pytest_sessionstart`` needs extending, so capture the
 # plugin's version and call through.
@@ -115,6 +138,32 @@ _plugin_pytest_sessionstart = pytest_sessionstart  # noqa: F405
 def pytest_sessionstart(session):
     _plugin_pytest_sessionstart(session)
 
+    # Swap ``config.db`` to the async engine's ``sync_engine`` proxy. Many
+    # compliance test bodies (BooleanTest, OrderByLabelTest, CompoundSelectTest,
+    # ExpandingBoundInTest, PostCompileParamsTest, TableDDLTest, etc.) do
+    # ``with config.db.begin() as conn:`` synchronously, hitting the bare
+    # AsyncEngine and raising
+    # ``'_AsyncGeneratorContextManager' object does not support the context
+    # manager protocol``. The TablesTest / TestBase / drop_all_tables patches
+    # below catch the fixture-mediated paths; this catches the direct ones.
+    # The AsyncAdapt DBAPI still runs underneath; the test loop bridges await
+    # calls via ``await_only`` inside the greenlet.
+    import sqlalchemy.testing as _testing_ns
+    from sqlalchemy.testing import config as sa_config
+    if hasattr(sa_config.db, "sync_engine"):
+        sync_eng = sa_config.db.sync_engine
+        # Patch all four bindings: per-Config, module-level
+        # ``sqlalchemy.testing.config.db``, AND the alias bound at import time
+        # by ``from .config import db`` inside ``sqlalchemy.testing.__init__``.
+        # ``AssertsExecutionResults.sql_execution_asserter`` reads the latter
+        # via ``from . import db``, so without the third assignment events
+        # still attach to the AsyncEngine and raise NotImplementedError.
+        sa_config.db = sync_eng
+        _testing_ns.db = sync_eng
+        for cfg in sa_config.Config.all_configs():
+            if hasattr(cfg.db, "sync_engine"):
+                cfg.db = cfg.db.sync_engine
+
     # AsyncEngine doesn't expose ``_run_ddl_visitor``; the compliance suite's
     # ``TablesTest._setup_once_tables`` calls ``metadata.create_all(cls.bind)``
     # which dispatches via that sync-only method. Hand back the underlying
@@ -123,7 +172,6 @@ def pytest_sessionstart(session):
     # ``await_only`` still bridges to the running event loop.
     from sqlalchemy.testing.fixtures import sql as sql_fixtures
     from sqlalchemy.testing.fixtures import base as base_fixtures
-    from sqlalchemy.testing import config as sa_config
 
     def _sync_db():
         db = sa_config.db

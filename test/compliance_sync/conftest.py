@@ -64,6 +64,23 @@ pytest.register_assert_rewrite("sqlalchemy.testing.assertions")
 from sqlalchemy.testing.plugin.pytestplugin import *  # noqa: E402, F401, F403
 
 
+# Data API rejects named-params with chars outside [A-Za-z0-9_]; deselect
+# the specific DifficultParametersTest combinations that can't pass.
+_DATA_API_REJECTED_PARAM_CHARS = ("/slashes/", "more/slashes", "q?marks")
+
+
+def pytest_collection_modifyitems(config, items):
+    keep, deselected = [], []
+    for item in items:
+        if any(f"[{p}]" in item.name for p in _DATA_API_REJECTED_PARAM_CHARS):
+            deselected.append(item)
+        else:
+            keep.append(item)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = keep
+
+
 # setup.cfg's ``[db] default`` is the async URL (shared with the async
 # compliance suite). SA's ``_engine_uri`` reads
 # ``file_config["db"]["default"]`` at ``post_begin`` time; we have to
