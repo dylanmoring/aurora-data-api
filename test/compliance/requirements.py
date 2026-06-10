@@ -378,3 +378,56 @@ class Requirements(SuiteRequirements):
         # Data API enum lacks, so ``select(literal(<tz_aware>))`` now
         # round-trips with tzinfo intact.
         return exclusions.open()
+
+    # ---- Opened 2026-06-10 after the tz-bind-cast fix; see test/SKIPS.md ----
+
+    @property
+    def time_timezone(self):
+        # ``TIME WITH TIME ZONE`` -- the datetime mixin's cast-to-self
+        # bind_expression carries the timezone flag for TIME too.
+        return exclusions.open()
+
+    @property
+    def datetime_historic(self):
+        # Pre-1900 datetimes; PG and isoformat both handle them.
+        return exclusions.open()
+
+    @property
+    def date_historic(self):
+        return exclusions.open()
+
+    @property
+    def ctes_with_values(self):
+        # PG supports ``WITH t AS (VALUES ...)``.
+        return exclusions.open()
+
+    @property
+    def update_from(self):
+        # PG ``UPDATE ... FROM``.
+        return exclusions.open()
+
+    @property
+    def delete_from(self):
+        # PG ``DELETE ... USING`` (SA compiles delete-from to this).
+        return exclusions.open()
+
+    @property
+    def reflect_tables_no_columns(self):
+        # PG allows zero-column tables.
+        return exclusions.open()
+
+    @property
+    def table_value_constructor(self):
+        # PG supports ``SELECT * FROM (VALUES ...) AS t(c1, c2)``.
+        return exclusions.open()
+
+    @property
+    def expression_server_defaults(self):
+        # PG reflects expression defaults via pg_attrdef.
+        return exclusions.open()
+
+    @property
+    def literal_float_coercion(self):
+        # Data API marshals Python float as doubleValue (IEEE double),
+        # which round-trips exactly -- no REAL4 truncation.
+        return exclusions.open()

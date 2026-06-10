@@ -2,9 +2,9 @@
 
 Derived from `pytest -rs` output, 2026-06-10. Applies identically to all
 four suites (this repo's `compliance` / `compliance_sync` and the
-sqlalchemy-aurora-data-api mirrors). At time of writing: **290 skips
-(sync) / 318 (async)**; the async delta is exactly the `sane_rowcount`
-block below.
+sqlalchemy-aurora-data-api mirrors). Current state: **252 skips in every
+suite** (sync and async are now identical; the former 28-skip async
+delta was the `supports_sane_rowcount = False` flag, since fixed).
 
 To regenerate: run a suite with `-rs`, aggregate the `SKIPPED [n]` lines.
 Class-level skips name the gating requirement via `__requires__`;
@@ -33,26 +33,31 @@ method-level skips report a generic "marked as skip" — find the
 | 2 | `supports_bitwise_shift` | every int marshalled as bigint; `int4 << int8` undefined in PG |
 | 1 | `infinity_floats` | JSON wire format can't carry IEEE Inf |
 
-## 3. Dialect features not implemented — fixable with work
+## 3. Dialect features not implemented — fixable with work (25)
 
 | Count | What | Notes |
 |---|---|---|
 | 11+6 | `autocommit`, `isolation_level` | needs isolation-level plumbing over Data API transactions |
 | 8 | `default_schema_name_switch` | doubtful: `SET search_path` won't survive stateless calls |
-| 28 (async only) | `sane_rowcount` (RowCountTest, SimpleUpdateDeleteTest) | async mixin declared `supports_sane_rowcount = False`; cursor does report rowcount — under test |
 
-## 4. Open-and-test candidates / known-deliberate closures
+## 4. Remaining tail (23)
 
 | Count | Requirement | Status |
 |---|---|---|
-| 6 | `time_timezone` | opening — tz bind-cast fix should cover timetz |
-| 6+6 | `datetime_historic`, `date_historic` | opening — PG handles pre-1900 |
-| 8 | `ctes_with_values` | opening — PG supports VALUES in CTE |
-| 2 | `update_from` / `delete_from` | opening — PG supports `UPDATE ... FROM` |
-| 5 | `reflect_tables_no_columns` | opening — PG allows zero-column tables |
-| 1 | `table_value_constructor` | opening — PG supports standalone `VALUES` |
-| 4 | `expression_server_defaults` | opening |
-| 8 | `literal_float_coercion` | opening — doubleValue is IEEE double, exact round-trip expected |
-| 3 | FK option reflection combos | gating requirements already open; combo-level cause uninvestigated |
 | 10 | `datetime_interval` | needs driver PG-interval → timedelta parsing (real work) |
+| 8 | `literal_float_coercion` combos (test_insert_w_floats) | requirement opened but combos still skip — gated by an additional per-combo exclusion, uninvestigated |
+| 3 | FK option reflection combos | gating requirements already open; combo-level cause uninvestigated |
 | 2 | collation reflection | deliberately closed — Aurora collation naming mismatch |
+
+## Resolved 2026-06-10 (were 66 skips, now passing)
+
+`time_timezone` (6 — needed both the tz bind-cast fix and a
+`column_expression` text-cast workaround: the Data API rejects TIMETZ
+*result columns* outright, so `_ADA_TIME` casts tz-aware time columns to
+text in SELECT lists and parses back, wrapped in `type_coerce` so the
+type's result processor still runs), `datetime_historic` (6),
+`date_historic` (6), `ctes_with_values` (8), `update_from` /
+`delete_from` (2), `reflect_tables_no_columns` (5),
+`table_value_constructor` (1), `expression_server_defaults` (4), and
+async `sane_rowcount` (28 — the async cursor reports rowcount fine; the
+`supports_sane_rowcount = False` flag was defensive and wrong).
