@@ -71,7 +71,8 @@ _DATA_API_TYPE_MAP = {
     int: "longValue",
     str: "stringValue",
     Decimal: "stringValue",
-    # list -> "arrayValue" not supported by our DB-API paramstyle mapping here
+    # list is handled structurally by _list_to_array_value (recursive) — not a
+    # flat type-map entry, because nested lists need to recurse into arrayValues.
 }
 
 # Python value type -> RDS Data API typeHint
@@ -101,9 +102,48 @@ def build_description(column_metadata):
         desc.append(col_desc)
     return desc
 
+def _list_to_array_value(lst):
+    """Recursively convert a Python list to a Data API ``arrayValue`` inner dict.
+
+    Returns the inner dict (e.g. ``{"longValues": [...]}`` or
+    ``{"arrayValues": [...]}``) — the caller wraps it in ``{"arrayValue": ...}``.
+
+    Picks the typed ``*Values`` key from the *first* element's Python type.
+    If the list contains nested lists, recurses and emits ``arrayValues``.
+    Mixed-type or None-containing lists fall back to ``stringValues`` with
+    ``str(elem)`` per element, matching the prior best-effort behaviour.
+    Empty list -> ``stringValues: []`` (a safe default; PG can cast text[] to
+    most array types for empty literals).
+    """
+    if not lst:
+        return {"stringValues": []}
+    # Nested arrays: every element must itself be a list. If any is a list,
+    # recurse on all (a mixed list-of-list/scalar is malformed for PG arrays
+    # anyway; let the recursion's str() fallback handle the odd case).
+    if any(isinstance(e, list) for e in lst):
+        return {"arrayValues": [_list_to_array_value(e) for e in lst]}
+    # None inside a typed *Values list is rejected by the Data API. Fall back
+    # to a string repr of the whole array (prior behaviour).
+    if any(e is None for e in lst):
+        return {"stringValues": [str(lst)]}
+    first_type = type(lst[0])
+    # bool is a subclass of int — check it first.
+    if first_type is bool and all(type(e) is bool for e in lst):
+        return {"booleanValues": list(lst)}
+    if first_type is int and all(type(e) is int for e in lst):
+        return {"longValues": list(lst)}
+    if first_type is float and all(type(e) is float for e in lst):
+        return {"doubleValues": list(lst)}
+    if first_type is str and all(type(e) is str for e in lst):
+        return {"stringValues": list(lst)}
+    # Mixed-type fallback: stringify each element.
+    return {"stringValues": [str(e) for e in lst]}
+
 def _prepare_param(name, value):
     if value is None:
         return dict(name=name, value=dict(isNull=True))
+    if isinstance(value, list):
+        return dict(name=name, value={"arrayValue": _list_to_array_value(value)})
     data_api_field = _DATA_API_TYPE_MAP.get(type(value), "stringValue")
     param = dict(name=name, value={data_api_field: value})
     if data_api_field == "stringValue" and not isinstance(value, str):
