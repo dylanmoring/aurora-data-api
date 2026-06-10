@@ -26,17 +26,148 @@ threadsafety = 0
 paramstyle = "named"
 
 
-# Leading whitespace, optional ``(`` or ``WITH ... AS (...)`` prefix, then the
-# first keyword token. Handles ``(SELECT ...) UNION ...``,
-# ``WITH cte AS (...) SELECT ...``, and ordinary ``SELECT ...``.
-_LEADING_KEYWORD_RE = re.compile(
-    r"^\s*(?:\(|WITH\b.*?\)\s*)*(\w+)", re.IGNORECASE | re.DOTALL
-)
 _RETURNING_RE = re.compile(r"\bRETURNING\b", re.IGNORECASE)
 _ROW_RETURNING_KEYWORDS = frozenset({
     "SELECT", "VALUES", "SHOW", "EXPLAIN", "FETCH", "TABLE",
 })
 _DML_KEYWORDS = frozenset({"INSERT", "UPDATE", "DELETE", "MERGE"})
+
+
+def _leading_keyword(sql: str) -> str:
+    """Return the leading keyword of ``sql`` (uppercased), skipping past any
+    leading ``(`` prefixes and any ``WITH [RECURSIVE] cte AS (...) [, ...]``
+    blocks. Returns ``''`` if no keyword is found.
+
+    A small hand-rolled scanner is used (rather than a regex) so that
+    balanced parens, string literals, identifier quoting, and SQL comments
+    inside CTE bodies don't confuse the leading-keyword detection.
+    """
+    i, n = 0, len(sql)
+
+    def skip_ws_and_comments(j: int) -> int:
+        while j < n:
+            c = sql[j]
+            if c.isspace():
+                j += 1
+            elif c == "-" and j + 1 < n and sql[j + 1] == "-":
+                # Line comment.
+                j += 2
+                while j < n and sql[j] != "\n":
+                    j += 1
+            elif c == "/" and j + 1 < n and sql[j + 1] == "*":
+                # Block comment (SQL block comments don't nest in standard
+                # SQL; close on the first ``*/``).
+                j += 2
+                while j < n and not (sql[j] == "*" and j + 1 < n and sql[j + 1] == "/"):
+                    j += 1
+                j += 2
+            else:
+                break
+        return j
+
+    def read_word(j: int):
+        start = j
+        while j < n and (sql[j].isalnum() or sql[j] == "_"):
+            j += 1
+        return sql[start:j], j
+
+    def skip_balanced_parens(j: int) -> int:
+        # Caller has positioned ``j`` on the opening ``(``.
+        assert sql[j] == "("
+        depth = 0
+        while j < n:
+            c = sql[j]
+            if c == "'" or c == '"':
+                # String/identifier literal — find the matching quote,
+                # respecting SQL's doubled-quote escape (``''`` / ``""``).
+                quote = c
+                j += 1
+                while j < n:
+                    if sql[j] == quote:
+                        if j + 1 < n and sql[j + 1] == quote:
+                            j += 2
+                            continue
+                        j += 1
+                        break
+                    j += 1
+                continue
+            if c == "-" and j + 1 < n and sql[j + 1] == "-":
+                j += 2
+                while j < n and sql[j] != "\n":
+                    j += 1
+                continue
+            if c == "/" and j + 1 < n and sql[j + 1] == "*":
+                j += 2
+                while j < n and not (sql[j] == "*" and j + 1 < n and sql[j + 1] == "/"):
+                    j += 1
+                j += 2
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+        return j
+
+    # Skip leading ``(`` prefixes — e.g. ``(SELECT ...) UNION (SELECT ...)``.
+    while True:
+        i = skip_ws_and_comments(i)
+        if i < n and sql[i] == "(":
+            i += 1
+            continue
+        break
+
+    i = skip_ws_and_comments(i)
+    word, j = read_word(i)
+    if not word:
+        return ""
+
+    if word.upper() != "WITH":
+        return word.upper()
+
+    # Walk past ``WITH [RECURSIVE] <ident> [(<cols>)] AS ( ... ) [, ...]``.
+    i = skip_ws_and_comments(j)
+    next_word, j2 = read_word(i)
+    if next_word.upper() == "RECURSIVE":
+        i = skip_ws_and_comments(j2)
+
+    while True:
+        # CTE name.
+        _name, i = read_word(i)
+        i = skip_ws_and_comments(i)
+        # Optional column list ``(col1, col2, ...)``.
+        if i < n and sql[i] == "(":
+            i = skip_balanced_parens(i)
+            i = skip_ws_and_comments(i)
+        # ``AS`` (optionally ``AS MATERIALIZED`` / ``AS NOT MATERIALIZED``).
+        as_word, i2 = read_word(i)
+        if as_word.upper() != "AS":
+            return ""
+        i = skip_ws_and_comments(i2)
+        # Optional ``MATERIALIZED`` / ``NOT MATERIALIZED``.
+        peek_word, peek_j = read_word(i)
+        if peek_word.upper() == "NOT":
+            after_not = skip_ws_and_comments(peek_j)
+            mat_word, mat_j = read_word(after_not)
+            if mat_word.upper() == "MATERIALIZED":
+                i = skip_ws_and_comments(mat_j)
+        elif peek_word.upper() == "MATERIALIZED":
+            i = skip_ws_and_comments(peek_j)
+        # CTE body.
+        if i >= n or sql[i] != "(":
+            return ""
+        i = skip_balanced_parens(i)
+        i = skip_ws_and_comments(i)
+        if i < n and sql[i] == ",":
+            i += 1
+            i = skip_ws_and_comments(i)
+            continue
+        break
+
+    final_word, _ = read_word(i)
+    return final_word.upper()
 
 
 def _statement_returns_rows(sql: str) -> bool:
@@ -51,10 +182,9 @@ def _statement_returns_rows(sql: str) -> bool:
     """
     if not sql:
         return False
-    match = _LEADING_KEYWORD_RE.match(sql)
-    if not match:
+    head = _leading_keyword(sql)
+    if not head:
         return False
-    head = match.group(1).upper()
     if head in _ROW_RETURNING_KEYWORDS:
         return True
     if head in _DML_KEYWORDS:
